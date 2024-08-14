@@ -1,7 +1,9 @@
 # dailylifeassysadmin.github.io
 
 
-<img src="banner/banner.png" alt="Introduction Banner.." style="text-align: center; margin-bottom: 300px; " />
+<img src="https://github.com/dailylifeassysadmin/dailylifeassysadmin/blob/main/banner/banner.png" alt="Introduction Banner.." style="text-align: center; margin-bottom: 300px; " />
+
+<!--- https://raw.githubusercontent.com/dailylifeassysadmin/dailylifeassysadmin/main/banner/banner.png --->
 
 
 - 👋 Hi, I’m @dailylifeassysadmin
