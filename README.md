@@ -1,4 +1,4 @@
-# dailylifeassysadmin.github.io
+<!--- # dailylifeassysadmin.github.io --->
 
 
 <img src="https://github.com/dailylifeassysadmin/dailylifeassysadmin/blob/main/banner/banner.png" alt="Introduction Banner.." style="text-align: center; margin-bottom: 300px; " />
@@ -11,7 +11,7 @@
 - 🌱 I’m currently learning Advance Python...
 - ❤️ I love Open Source Software...
 - 🐧 Linux is my crush
-- 📫 you can reach out to me via below mentioned link ...
+- 📫 You can reach out to me via below mentioned link ...
 <!--- - 💞️ I’m looking to collaborate on ... --->
 
 <!--- Social media Link --->
