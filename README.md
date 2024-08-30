@@ -1,14 +1,14 @@
 <!--- # dailylifeassysadmin.github.io --->
-
-
+---
 <img src="https://github.com/dailylifeassysadmin/dailylifeassysadmin/blob/main/banner/banner.png" alt="Introduction Banner.." style="text-align: center; margin-bottom: 300px; " />
 
 <!--- https://raw.githubusercontent.com/dailylifeassysadmin/dailylifeassysadmin/main/banner/banner.png --->
+<h1 align="center">Hi 👋, I'm Ravi</h1>
+<h3 align="center">A passionate and hard working Linux system enginner from India :india:</h3>
 
-
+---
 - 👋 Hi, I’m @dailylifeassysadmin
-- 
-- 👀 I’m interested in everything about Computer, from Hacking to Web Technologies, to designing system, I mean everything...
+- - 👀 I’m interested in everything about Computer, from Hacking to Web Technologies, to designing system, I mean everything...
 - 🐧 Linux enthusiast!! and System Administrator
 - 🌱 I’m currently learning Advance Python and Shell Scripting ...
 - ❤️ I love Open Source Software...
