@@ -22,13 +22,17 @@ for i in {1..9}; do if (($i != 6)); then echo $i; fi; done;
 
 - **Answer 4.1:**
 
-    ss -tulnp | grep “port numner”
+```C
+ss -tulnp | grep “port numner”
+```
     
 and then use `kill` command to kill or stop the process.
 
 - **Answer 4.2:**
 
-    netstat -tulnp | grep “port number”
+```C
+netstat -tulnp | grep “port number”
+```
 
 and then use `kill` command to kill or stop the process.
 
@@ -37,7 +41,9 @@ and then use `kill` command to kill or stop the process.
 
 - **Answer 5:**
 
-    top -o %MEM | head -n 12
+```C
+top -o %MEM | head -n 12
+```
 
 [Please don’t show 5 with head, because head -n 5 will only display top 5, which has usual information.](https://unix.stackexchange.com/questions/128953/how-to-display-top-results-sorted-by-memory-usage-in-real-time)
 
@@ -51,37 +57,52 @@ and then use `kill` command to kill or stop the process.
 
 - **Answer 7:**
 
-    route
-    netstat -r
+```C
+route
+```
+
+```C
+netstat -r
+```
 
 
 **Question 8: A file is there and changes its output from new line to comma separated.**
 
-    $ cat pass.txt
-    ubuntu
-    hello
-    buddy
-    world!!
-    two
-    three
-    four
+```C
+$ cat pass.txt
+ubuntu
+hello
+buddy
+world!!
+two
+three
+four
+```
 
 - **Answer 8.1:**
 
-      sed -z 's/\n/,/g' pass.txt
+```C
+sed -z 's/\n/,/g' pass.txt
+```
 
 - **Answer 8.2:**
 
-      echo pass.txt | tr “\n” “,”
+```C
+echo pass.txt | tr “\n” “,”
+```
 
 
 **Question 9: What will be the output of this command?**
 
-    $ iostat -x 5 10
+```C
+$ iostat -x 5 10
+```
 
-**Answer 9:**
+- **Answer 9:**
 
-    iostat -x 5 10
+```C
+iostat -x 5 10
+```
 
 **What is iostat?**
 
@@ -96,40 +117,138 @@ Let’s go through the full output of iostat step by step, explaining each secti
 
 **Question 10: Your file system is corrupted, how will you check and recover it?**
 
-**Answer 10:** With the [`fsck`](https://phoenixnap.com/kb/fsck-command-linux) command, I will check and recover the file system.
+- **Answer 10:** With the [`fsck`](https://phoenixnap.com/kb/fsck-command-linux) command, I will check and recover the file system.
 
 
 **Question 11: How can I update the changes made in grub?**
 
-**Answer 11.1: For Debian OS**
+- **Answer 11.1: For Debian OS**
 
-    update-grub
+```C
+update-grub
+```
 
-**Answer 11.2: For RHEL OS**
+- **Answer 11.2: For RHEL OS**
 
 Or [update-grub](https://unix.stackexchange.com/questions/712643/how-can-i-make-grub-changes-permanent) is a Debianism and might not exist in Manjaro. Try `sudo grub-mkconfig -o /boot/grub/grub.cfg` or `sudo grub2-mkconfig -o /boot/grub/grub.cfg`
 
 
 **Question 12: What is the difference between YUM and RPM?**
 
-**Answer 12:**RPM is a package format and management system for Linux, while YUM is a higher-level package manager built on top of RPM that simplifies package installation and updates. RPM handles the underlying packaging and verification, while YUM provides features like dependency resolution and repository management.
+- **Answer 12:** RPM is a package format and management system for Linux, while YUM is a higher-level package manager built on top of RPM that simplifies package installation and updates. RPM handles the underlying packaging and verification, while YUM provides features like dependency resolution and repository management.
 
 
-**Question 12: What is the difference between YUM and RPM?**
+**Question 13: Use `for` loop to check if a list of servers is alive and print its uptime in the terminal?**
 
-**Answer 12:**RPM is a package format and management system for Linux, while YUM is a higher-level package manager built on top of RPM that simplifies package installation and updates. RPM handles the underlying packaging and verification, while YUM provides features like dependency resolution and repository management.
+- **Answer 13:** Please find the below code with `for` loop in `bash`.
+
+```C
+#!/usr/bin/env bash
+        
+for ip in `cat iplist`;
+do
+ssh -i path_of_ssh_key "user@$ip" 'hostname; uptime'
+echo "done"
+done
+```
 
 
-**Question 12: What is the difference between YUM and RPM?**
+**Question 14: Use `while` loop to check if a list of servers is alive and print its uptime in the terminal?**
 
-**Answer 12:**RPM is a package format and management system for Linux, while YUM is a higher-level package manager built on top of RPM that simplifies package installation and updates. RPM handles the underlying packaging and verification, while YUM provides features like dependency resolution and repository management.
+- **Answer 14:** Please find the below code with `while` loop in `bash`.
+
+```C
+#!/usr/bin/env bash
+        
+while read ip
+do
+ssh -i path_of_ssh_key "user@$ip" 'hostname; uptime'
+echo "done"
+done < iplist
+```
 
 
-**Question 12: What is the difference between YUM and RPM?**
+**Question 15: What is the difference bw sudo su and sudo su - or sudo -i**
 
-**Answer 12:**RPM is a package format and management system for Linux, while YUM is a higher-level package manager built on top of RPM that simplifies package installation and updates. RPM handles the underlying packaging and verification, while YUM provides features like dependency resolution and repository management.
+- **Answer 15:** The primary difference between sudo su and sudo su - lies in how they handle the user's environment after switching to the root user. sudo su keeps you in your current directory and retains your environment variables, while sudo su - switches to the root user's home directory and sets the environment to the root user's default setup. In essence, sudo su - is equivalent to sudo -i
 
 
-**Question 12: What is the difference between YUM and RPM?**
+**Question 16: What is the default file system in RHEL 7?**
 
-**Answer 12:**RPM is a package format and management system for Linux, while YUM is a higher-level package manager built on top of RPM that simplifies package installation and updates. RPM handles the underlying packaging and verification, while YUM provides features like dependency resolution and repository management.
+- **Answer 16:** The default file system in RHEL 7 is `xfs`.
+
+
+**Question 17: What is the difference between init vs systemd service?**
+
+- **Answer 17:** .
+
+
+**Question 18: How to idedntify or found out the hard disk serial number from linux command**
+
+- **Answer 18:** .
+
+
+**Question 19: How to identify the `NIC` serial number from linux command?**
+
+- **Answer 19:** .
+
+
+**Question 20: What is the difference between problem management and incident management?**
+
+- **Answer 20:** Incident management focuses on addressing immediate disruptions to IT services, aiming for quick resolution and service restoration within agreed-upon SLAs. Problem management, on the other hand, focuses on preventing future incidents by identifying and resolving the root causes of recurring issues, leading to long-term service improvements.
+
+
+**Question 21: Write a bash program to know about the OS information.**
+
+- **Answer 21:**
+
+```C
+#!/usr/bin/env bash
+
+echo -e $(cat /etc/issue)
+```
+
+
+**Question 22: Write a `for` loop program to write down the number from 1 to 100.**
+
+- **Answer 22:** Please find the below `bash` code.
+
+```C
+#!/usr/bin/env bash
+
+for i in {1..100}
+do
+echo $i
+done
+```
+
+
+**Question 23: What is hard link and soft link in Linux**
+
+- **Answer 23:** 
+
+
+**Question 24: What is stateful and stateless?**
+
+- **Answer 24:** 
+
+
+**Question 25: What is `Security Group` in AWS**
+
+- **Answer 25:** 
+
+
+**Question 26: What is `NACL` in AWS**
+
+- **Answer 26:** 
+
+
+**Question 27: What is the difference between `NACL` and `Security Group`?**
+
+- **Answer 27:** 
+
+
+**Question 28: What is stateful and stateless?**
+
+- **Answer 28:** 
+
