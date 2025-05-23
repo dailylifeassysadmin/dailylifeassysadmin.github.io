@@ -14,6 +14,7 @@
 - ❤️ I love Open Source Software...
 - 🐧 Linux is my crush
 - 📫 You can reach out to me via below mentioned link ...
+- [interview Question](faq.md)
 <!--- - 💞️ I’m looking to collaborate on ... --->
 
 <!--- Social media Link --->
