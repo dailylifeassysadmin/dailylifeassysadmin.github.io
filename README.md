@@ -15,7 +15,7 @@
 - 🐧 Linux is my crush
 - 📫 You can reach out to me via below mentioned link ...
 - [interview Question](faq.md)
-- [CheatSheet](Chaetsheet.md)
+- [CheatSheet](Cheatsheet.md)
 <!--- - 💞️ I’m looking to collaborate on ... --->
 
 <!--- Social media Link --->
