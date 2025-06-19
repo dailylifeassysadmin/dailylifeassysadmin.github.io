@@ -1,6 +1,6 @@
 The Only Linux Command List You'll Need to Bookmark:
 
-Daily Heroes:
+**Daily Heroes:**
 
 - ps aux | grep {process} - Find that sneaky process
 - lsof -i :{port} - Who's hogging that port?
@@ -8,7 +8,7 @@ Daily Heroes:
 - netstat -tulpn - Network connection detective
 - kubectl get pods | grep -i error - K8s trouble finder
 
-Log Warriors:
+**Log Warriors:**
 
 - tail -f /var/log/* - Real-time log watcher
 - journalctl -fu service-name - SystemD log stalker
@@ -16,7 +16,7 @@ Log Warriors:
 - zcat access.log.gz | grep "500" - Compressed log ninja
 - less +F - The better tail command
 
-Container Whisperers:
+**Container Whisperers:**
 
 - docker ps --format '{{.Names}} {{.Status}}' - Clean status check
 - docker stats --no-stream - Quick resource check
@@ -24,7 +24,7 @@ Container Whisperers:
 - docker exec -it - The container backdoor
 - podman top - Process peek inside containers
 
-System Detectives:
+**System Detectives:**
 
 - htop - System resource storyteller
 - iostat -xz 1 - Disk performance poet
@@ -32,7 +32,7 @@ System Detectives:
 - vmstat 1 - System vital signs
 - dmesg -T | tail - Kernel's recent gossip
 
-Network Ninjas:
+**Network Ninjas:**
 
 - curl -v - HTTP conversation debugger
 - dig +short - Quick DNS lookup
@@ -40,7 +40,7 @@ Network Ninjas:
 - iptables -L - Firewall rule reader
 - traceroute - Path finder
 
-File Jugglers:
+**File Jugglers:**
 
 - find . -name "*.yaml" -type f - YAML hunter
 - rsync -avz - Better file copier
@@ -48,7 +48,7 @@ File Jugglers:
 - ln -s - Symlink wizard
 - chmod +x - Make it executable
 
-Performance Profilers:
+**Performance Profilers:**
 
 - strace -p {pid} - System call spy
 - tcpdump -i any - Network packet sniffer
@@ -56,7 +56,7 @@ Performance Profilers:
 - uptime - Load average at a glance
 - top -c - Classic process viewer
 
-Git Essentials:
+**Git Essentials:**
 
 - git log --oneline - History simplified
 - git reset --hard HEAD^ - The "oops" eraser
@@ -64,13 +64,13 @@ Git Essentials:
 - git diff --cached - What's staged?
 - git blame - The "who did this?" resolver
 
-Quick Fixes:
+**Quick Fixes:**
 
 - sudo !! - Run last command with sudo
 - ctrl+r - Command history search
 - history | grep - Command time machine
 - alias - Command shortcut maker
 - watch - Command repeater
-- Shift+Ctrl+# - It will save the command in history without running it in the terminal
+- ```Shift+Ctrl+#``` - It will save the command in history without running it in the terminal
 
 Which ones are your go-to commands?
