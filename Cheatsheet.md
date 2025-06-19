@@ -1,6 +1,7 @@
 The Only Linux Command List You'll Need to Bookmark:
 
 Daily Heroes:
+
 • ps aux | grep {process} - Find that sneaky process
 • lsof -i :{port} - Who's hogging that port?
 • df -h - The classic "we're out of space" checker
@@ -8,6 +9,7 @@ Daily Heroes:
 • kubectl get pods | grep -i error - K8s trouble finder
 
 Log Warriors:
+
 • tail -f /var/log/* - Real-time log watcher
 • journalctl -fu service-name - SystemD log stalker
 • grep -r "error" . - The error hunter
@@ -15,6 +17,7 @@ Log Warriors:
 • less +F - The better tail command
 
 Container Whisperers:
+
 • docker ps --format '{{.Names}} {{.Status}}' - Clean status check
 • docker stats --no-stream - Quick resource check
 • crictl logs {container} - Raw container stories
@@ -22,6 +25,7 @@ Container Whisperers:
 • podman top - Process peek inside containers
 
 System Detectives:
+
 • htop - System resource storyteller
 • iostat -xz 1 - Disk performance poet
 • free -h - Memory mystery solver
@@ -29,6 +33,7 @@ System Detectives:
 • dmesg -T | tail - Kernel's recent gossip
 
 Network Ninjas:
+
 • curl -v - HTTP conversation debugger
 • dig +short - Quick DNS lookup
 • ss -tunlp - Socket statistics simplified
@@ -36,6 +41,7 @@ Network Ninjas:
 • traceroute - Path finder
 
 File Jugglers:
+
 • find . -name "*.yaml" -type f - YAML hunter
 • rsync -avz - Better file copier
 • tar -xvf - The unzipper (yes, we all google this)
@@ -43,6 +49,7 @@ File Jugglers:
 • chmod +x - Make it executable
 
 Performance Profilers:
+
 • strace -p {pid} - System call spy
 • tcpdump -i any - Network packet sniffer
 • sar -n DEV 1 - Network stats watch
@@ -50,6 +57,7 @@ Performance Profilers:
 • top -c - Classic process viewer
 
 Git Essentials:
+
 • git log --oneline - History simplified
 • git reset --hard HEAD^ - The "oops" eraser
 • git stash - The work hider
@@ -57,6 +65,7 @@ Git Essentials:
 • git blame - The "who did this?" resolver
 
 Quick Fixes:
+
 • sudo !! - Run last command with sudo
 • ctrl+r - Command history search
 • history | grep - Command time machine
