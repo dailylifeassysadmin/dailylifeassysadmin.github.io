@@ -8,14 +8,14 @@
 
 ---
 - 👋 Hi, I’m @dailylifeassysadmin
-- - 👀 I’m interested in everything about Computer, from Hacking to Web Technologies, to designing system, I mean everything...
+- 👀 I’m interested in everything about Computer, from Hacking to Web Technologies, to designing system, I mean everything...
 - 🐧 Linux enthusiast!! and System Administrator
 - 🌱 I’m currently learning Advance Python and Shell Scripting ...
 - ❤️ I love Open Source Software...
 - 🐧 Linux is my crush
 - 📫 You can reach out to me via below mentioned link ...
-- [interview Question](faq.md)
-- [CheatSheet](Cheatsheet.md)
+- 👀 [interview Question](faq.md)
+- 👀 [CheatSheet](Cheatsheet.md)
 <!--- - 💞️ I’m looking to collaborate on ... --->
 
 <!--- Social media Link --->
