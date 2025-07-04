@@ -301,3 +301,74 @@ Having conducted many DevOps interviews, let me share what really matters when i
 👉 10) What happens if you rename a resource in your Terraform code?
 
 - ✅Answer: Terraform sees this as destroying and recreating the resource. Use "terraform state mv" to update state while preserving infrastructure, avoiding rebuilds and downtime.
+
+
+
+----------------------------------------------------------
+----------------------------------------------------------
+            Cloud DevOps Interview Questions 
+----------------------------------------------------------
+----------------------------------------------------------
+
+PWC Interview experience for Senior DevOps Engineer role
+
+Round 1: Screening Round (30 minutes)
+
+- Walk me through your current project architecture and your role in it.
+- Which DevOps tools have you worked with in the last 2 years?
+- What AWS services have you used in production?
+- Explain the difference between EC2 and ECS.
+- How do you expose a Kubernetes application to external traffic?
+- What is the purpose of a NAT Gateway?
+- How do you check running processes in Linux?
+- What command would you use to find files larger than 100MB?
+- What is the difference between Deployment and StatefulSet in Kubernetes?
+- How do you provide access to an S3 bucket from an EC2 instance?
+- What is a ConfigMap and how is it different from a Secret?
+- How do you check network connectivity between two servers?
+- Describe your experience with CI/CD pipelines.
+- What containerization technologies have you worked with?
+
+Round 2: Technical Round (60 minutes)
+
+- You have an application in Account A that needs to access an S3 bucket in Account B. How would you configure this?
+- Write a Dockerfile for a Node.js application with multi-stage builds.
+- How do you handle Terraform state file corruption?
+- Your EC2 instance in a private subnet needs to download packages without NAT Gateway. What alternatives exist?
+- How do you debug a container that has exited?
+- You need to import an existing AWS VPC into Terraform. What are the steps?
+- How would you implement blue-green deployment in Kubernetes?
+- Write a shell script to check if a service is running and restart it if down.
+- How do you manage secrets in Terraform without hardcoding them?
+- What's the difference between COPY and ADD commands in Dockerfile?
+- How would you implement cross-account resource provisioning using Terraform?
+- How do you implement parallel job execution in Jenkins?
+- How would you handle secrets in a Docker container for a PHP application connecting to MySQL?
+- An S3 bucket was created via Terraform but someone manually added a policy. How do you handle this drift?
+- How do you secure a Jenkins server in production?
+Your application is hosted in S3 and users globally are experiencing high latency. How would you optimize this?
+- How do you implement network policies to restrict pod-to-pod communication in Kubernetes?
+- Write a Python script to backup all files older than 30 days from a directory.
+- Your company's cloud costs are increasing rapidly. - How would you approach cost optimization without impacting performance?
+- How would you set up geolocation-based routing using AWS services?
+- What strategies do you use to manage Jenkins server space issues?
+
+Deep Grilling Scenario: A critical production Kubernetes cluster is experiencing multiple issues. Pods are stuck in ImagePullBackOff, some pods are being evicted, and users are reporting 503 errors from the application.
+
+- What would be your immediate first step to assess the situation?
+- How would you troubleshoot the ImagePullBackOff issue?
+- What commands would you run to investigate the pod evictions?
+- How would you identify which pods are causing the 503 errors?
+- What long-term measures would you implement to prevent this situation?
+
+Round 3: Behavioral Round
+
+- Describe a time when you had to troubleshoot a critical production issue. What was your approach?
+- Tell me about a situation where you disagreed with a fellow engineer on a technical decision.
+- How do you handle a situation where you're asked to work on a technology you have no experience with?
+- Describe a time when you had to work with tight deadlines and limited resources.
+- Tell me about a mistake you made in production and how you handled it.
+- How do you ensure smooth collaboration when working with development teams?
+- Describe the most challenging technical problem you've solved in your career.
+- How would you convince stakeholders to adopt a new technology or process?
+- Tell me about a time when you had to learn a new tool quickly to solve a business problem.
