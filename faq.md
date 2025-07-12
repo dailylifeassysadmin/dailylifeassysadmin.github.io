@@ -245,18 +245,16 @@ done
 
 **Question 27: What is the difference between `NACL` and `Security Group`?**
 
-- **Answer 27:** 
+- **Answer 27:** Security Group works on Instance level where NACL works on Subnet level.
 
 
 **Question 28: What is stateful and stateless?**
 
-- **Answer 28:** 
+- **Answer 28:** In AWS, stateful and stateless refer to how applications handle data between user sessions or requests. Stateful applications retain data from previous interactions, while stateless applications treat each interaction as independent, without retaining context from prior interactions.
 
 
 ----------------------------------------------------------
-----------------------------------------------------------
-               Terraform Interview Questions 
-----------------------------------------------------------
+                                    Terraform Interview Questions 
 ----------------------------------------------------------
 
 
@@ -303,12 +301,10 @@ Having conducted many DevOps interviews, let me share what really matters when i
 - ✅Answer: Terraform sees this as destroying and recreating the resource. Use "terraform state mv" to update state while preserving infrastructure, avoiding rebuilds and downtime.
 
 
+----------------------------------------------------------
+                                    Cloud DevOps Interview Questions 
+----------------------------------------------------------
 
-----------------------------------------------------------
-----------------------------------------------------------
-            Cloud DevOps Interview Questions 
-----------------------------------------------------------
-----------------------------------------------------------
 
 PWC Interview experience for Senior DevOps Engineer role
 
