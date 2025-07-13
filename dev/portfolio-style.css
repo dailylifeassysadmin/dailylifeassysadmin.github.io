@@ -1,0 +1,45 @@
+body {
+    background-color: #000;
+    /* max-height: 500px; */
+    /* max-width: 1400px; */
+    /* width: 100px; */
+    /* height: 100px; */
+    margin: 15px;
+    padding: 15px;
+}
+div {
+    border-style: dashed;
+    border-color: brown;
+    padding: 25px;
+    background-color: black;
+    /* float: left; */
+}
+
+.second {
+    float: left;
+    width: 50%;
+    border-style: solid;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+.row {
+    background-image: url(/dev/assets/images/backgroumd-image.jpg);
+}
+.column {
+    float: left;
+    width: 50%;
+    padding: 10px;
+    height: 500px;
+    /* background-image: url(/dev/assets/images/backgroumd-image.jpg); */
+
+}
+
+.row::after {
+    content: "";
+    display: table;
+    clear: both;
+    /* background-image: url(/dev/assets/images/backgroumd-image.jpg); */
+}

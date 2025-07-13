@@ -1,0 +1,53 @@
+body {
+  
+  font-family: "Sofia", cursive;
+  font-weight: 400;
+  font-style: normal;
+  /* width: 1400px; */
+  padding: 15px;
+  margin-top: 15px;
+  margin-left: 25px;
+  margin-right: 25px;
+  
+  /* font-family: "Grey Qo", cursive;
+  font-weight: 1200;
+  font-style: normal;
+  font-size: xx-large; */
+  
+  /* font-family: "Rock Salt", cursive;
+  font-weight: 500;
+  font-style: normal; */
+
+  /* font-family: "Bungee Shade", sans-serif;
+  font-weight: 400;
+  font-style: normal; */
+}
+.Text {
+  font-family: "Rock Salt", cursive;
+  color: blue;
+}
+
+div.FirstDiv {
+  /* border-color: brown; */
+  /* background-color: bisque; */
+  padding: 15px;
+  /* margin: 150px; */
+  /* text-align: center; */
+  background-image: url(/dev/assets/images/backgroumd-image.jpg);
+  /* -webkit-transform: rotate(180deg); */
+  /* -moz-transform: rotate(120deg); */
+  border-radius: 30px;
+  border-style: dashed;
+  border-color: blue;
+  background-size: 100%;
+  background-repeat: no-repeat;
+  background-position: center;
+}
+
+div.FirstDiv.h3 {
+  font-family: "Bungee Shade", sans-serif;
+  font-weight: 400;
+  font-style: normal;
+  margin: 15px;
+  padding: 15px;
+}
