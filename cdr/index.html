@@ -1,0 +1,4124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CDR Intelligence Dashboard</title>
+
+<!-- ═══ INLINE PARSERS (work from file:// without internet) ══════════════
+     PapaParse and XLSX are defined inline FIRST.
+     The CDN <script> tags below will OVERRIDE them if internet is available,
+     giving the best of both worlds: offline CSV/XLSX parsing always works,
+     and full-featured CDN versions load when online.
+     Chart.js / jsPDF / Leaflet still need internet for visuals / PDF / map.
+═══════════════════════════════════════════════════════════════════════════ -->
+<script>
+// ── INLINE CSV PARSER (PapaParse-compatible, handles all CDR formats) ─────────
+window.PapaParse = {
+  parse: function(file, cfg) {
+    cfg = cfg || {};
+    var reader = new FileReader();
+    reader.onload = function(ev) {
+      var txt = ev.target.result;
+
+      // 1. Strip UTF-8 BOM
+      if (txt.charCodeAt(0) === 0xFEFF) txt = txt.slice(1);
+
+      // 2. Normalise line endings
+      txt = txt.split('\r\n').join('\n').split('\r').join('\n');
+
+      // 3. Strip surrounding single/double quotes from a value
+      function cleanVal(v) {
+        v = (v || '').trim();
+        if (v.length >= 2 && v[0] === '"' && v[v.length-1] === '"') {
+          v = v.slice(1, -1).replace(/""/g, '"').trim();
+        }
+        if (v.length >= 2 && v[0] === "'" && v[v.length-1] === "'") {
+          v = v.slice(1, -1).trim();
+        }
+        return v;
+      }
+
+      // 4. Split raw text into lines (keep all for header search)
+      var allLines = txt.split('\n');
+
+      // 5. Auto-detect delimiter from the most-comma/tab/semicolon/pipe line
+      function detectDelim(line) {
+        var counts = {
+          ',':  (line.match(/,/g)  || []).length,
+          '\t': (line.match(/\t/g) || []).length,
+          ';':  (line.match(/;/g)  || []).length,
+          '|':  (line.match(/\|/g) || []).length
+        };
+        var best = ',', max = 0;
+        for (var d in counts) { if (counts[d] > max) { max = counts[d]; best = d; } }
+        return best;
+      }
+
+      // 6. Split a single line respecting double-quoted fields
+      function splitLine(line, delim) {
+        var fields = [], cur = '', inQ = false;
+        for (var i = 0; i < line.length; i++) {
+          var c = line[i];
+          if (inQ) {
+            if (c === '"') {
+              if (line[i+1] === '"') { cur += '"'; i++; }
+              else inQ = false;
+            } else { cur += c; }
+          } else {
+            if (c === '"') { inQ = true; }
+            else if (c === delim) { fields.push(cur); cur = ''; }
+            else { cur += c; }
+          }
+        }
+        fields.push(cur);
+        return fields;
+      }
+
+      // 7. ── FIND THE HEADER ROW ──────────────────────────────────────────────
+      //    Known CDR column keywords — if a line contains several of these
+      //    it is the header row, even if it has preamble above it.
+      var CDR_KEYWORDS = [
+        'target no','b party','a party','called','caller','imei','imsi',
+        'cell id','cell','duration','dur','date','time','call type',
+        'cgi','roam','msisdn','number','cli','ani','party'
+      ];
+
+      function scoreHeaderLine(line, delim) {
+        // Clean and split the line, then count how many fields match CDR keywords
+        var fields = splitLine(line, delim).map(cleanVal);
+        if (fields.length < 2) return 0;
+        var score = 0;
+        fields.forEach(function(f) {
+          var fl = f.toLowerCase();
+          CDR_KEYWORDS.forEach(function(kw) {
+            if (fl.indexOf(kw) !== -1) score++;
+          });
+        });
+        // Bonus: more fields = more likely a header
+        score += Math.min(fields.length / 2, 5);
+        return score;
+      }
+
+      // Find the line with the highest header score within the first 30 lines
+      var searchDepth = Math.min(30, allLines.length);
+      var bestScore = 0, headerLineIdx = 0;
+      var delim = ',';
+
+      for (var li = 0; li < searchDepth; li++) {
+        var line = allLines[li].trim();
+        if (!line) continue;
+        var d = detectDelim(line);
+        var score = scoreHeaderLine(line, d);
+        if (score > bestScore) {
+          bestScore = score;
+          headerLineIdx = li;
+          delim = d;
+        }
+      }
+
+      // Re-detect delimiter from the identified header line
+      delim = detectDelim(allLines[headerLineIdx]);
+
+      // 8. Parse from header row downward
+      var headers = splitLine(allLines[headerLineIdx], delim).map(cleanVal);
+
+      // Filter out completely empty trailing header columns
+      while (headers.length && headers[headers.length-1] === '') headers.pop();
+      var headerCount = headers.length;
+
+      // 9. ── DETECT FOOTER / BOTTOM METADATA ───────────────────────────────────
+      //    A row is treated as bottom metadata (and everything after it is dropped)
+      //    if it matches ANY of these conditions:
+      //      a) Has far fewer populated fields than the header (< 40% of header cols)
+      //      b) First field contains a footer keyword
+      //      c) Row looks like a summary line (e.g. "Total Records: 1234")
+      var FOOTER_KEYWORDS = [
+        'total', 'count', 'record', 'generated', 'end of', 'report end',
+        'extracted', 'printed', 'summary', 'grand total', 'sub total',
+        'subtotal', 'disclaimer', 'confidential', 'page', 'rows',
+        'this report', 'data as of', 'note:', 'powered by'
+      ];
+
+      function isFooterRow(fields) {
+        // Count non-empty fields
+        var filled = fields.filter(function(v) { return v !== ''; }).length;
+        // Condition a: very sparse row (less than 40% of header columns filled)
+        if (filled > 0 && filled < Math.ceil(headerCount * 0.4)) return true;
+        // Condition b: first non-empty field matches a footer keyword
+        var firstVal = '';
+        for (var fi = 0; fi < fields.length; fi++) {
+          if (fields[fi]) { firstVal = fields[fi].toLowerCase(); break; }
+        }
+        for (var ki = 0; ki < FOOTER_KEYWORDS.length; ki++) {
+          if (firstVal.indexOf(FOOTER_KEYWORDS[ki]) !== -1) return true;
+        }
+        // Condition c: looks like a key:value metadata line
+        // (only 1-2 fields populated and first field ends with ':' or '=')
+        if (filled <= 2 && (firstVal.slice(-1) === ':' || firstVal.slice(-1) === '=')) return true;
+        return false;
+      }
+
+      // 10. Build data rows — stop at first footer row
+      var data = [];
+      var consecutiveFooterRows = 0;
+      for (var r = headerLineIdx + 1; r < allLines.length; r++) {
+        var lineStr = allLines[r];
+
+        // Skip blank lines but don't treat them as footers
+        if (!lineStr.trim()) {
+          if (cfg.skipEmptyLines) continue;
+          // Two consecutive blank lines after data started = likely end of data
+          if (data.length > 0) {
+            consecutiveFooterRows++;
+            if (consecutiveFooterRows >= 2) break;
+          }
+          continue;
+        }
+        consecutiveFooterRows = 0;
+
+        var fields = splitLine(lineStr, delim).map(cleanVal);
+
+        // Skip entirely empty rows
+        if (!fields.some(function(v) { return v !== ''; })) continue;
+
+        // Stop if this looks like a footer/metadata row
+        if (data.length > 0 && isFooterRow(fields)) break;
+
+        var obj = {};
+        for (var h = 0; h < headers.length; h++) {
+          obj[headers[h]] = fields[h] !== undefined ? fields[h] : '';
+        }
+        data.push(obj);
+      }
+
+      if (cfg.complete) cfg.complete({ data: data, errors: [], meta: { fields: headers } });
+    };
+    reader.readAsText(file, 'UTF-8');
+  }
+};
+
+// ── INLINE XLSX PARSER (SheetJS-compatible subset) ───────────────────────────
+// Reads .xlsx files using DecompressionStream (Chrome 80+, Edge 80+, FF 113+)
+// Falls back gracefully if decompression is unavailable.
+window.XLSX = {
+  read: function(ab, opts) {
+    // ab = ArrayBuffer from FileReader.readAsArrayBuffer
+    var uint8 = new Uint8Array(ab);
+    var entries = {};
+    var i = 0;
+    // Walk ZIP local file headers
+    while (i < uint8.length - 30) {
+      if (uint8[i]===0x50 && uint8[i+1]===0x4B && uint8[i+2]===0x03 && uint8[i+3]===0x04) {
+        var comp    = uint8[i+8]  | (uint8[i+9]  << 8);
+        var csz     = uint8[i+18] | (uint8[i+19] << 8) | (uint8[i+20] << 16) | (uint8[i+21] * 0x1000000);
+        var fnLen   = uint8[i+26] | (uint8[i+27] << 8);
+        var exLen   = uint8[i+28] | (uint8[i+29] << 8);
+        var fnBytes = uint8.slice(i + 30, i + 30 + fnLen);
+        var fname   = new TextDecoder('utf-8').decode(fnBytes);
+        var dStart  = i + 30 + fnLen + exLen;
+        var chunk   = uint8.slice(dStart, dStart + csz);
+        if (comp === 0) {
+          // Stored — decode directly
+          entries[fname] = new TextDecoder('utf-8').decode(chunk);
+        } else if (comp === 8) {
+          // Deflate — store raw bytes for async decompression
+          entries[fname] = { _deflate: chunk };
+        }
+        i = dStart + csz;
+      } else { i++; }
+    }
+    // Parse shared strings (sync — only stored entries available sync)
+    var ss = [];
+    if (entries['xl/sharedStrings.xml'] && typeof entries['xl/sharedStrings.xml'] === 'string') {
+      ss = this._parseSSSync(entries['xl/sharedStrings.xml']);
+    }
+    // Find sheet1
+    var shXml = entries['xl/worksheets/sheet1.xml'];
+    var shData = (shXml && typeof shXml === 'string') ? shXml : null;
+    var ws = shData ? this._parseWS(shData, ss) : {};
+    return { SheetNames: ['Sheet1'], Sheets: { Sheet1: ws } };
+  },
+  _parseSSSync: function(xml) {
+    var arr = [], m, re = /<t(?:\s[^>]*)?>([^<]*)<\/t>/g;
+    while ((m = re.exec(xml)) !== null) {
+      arr.push(m[1].replace(/&amp;/g,'&').replace(/&lt;/g,'<')
+        .replace(/&gt;/g,'>').replace(/&quot;/g,'"').replace(/&#39;/g,"'"));
+    }
+    return arr;
+  },
+  _parseWS: function(xml, ss) {
+    var ws = {}, m;
+    var re = /<c\s+r="([A-Z]+\d+)"(?:[^>]*\bt="([^"]*)")?[^>]*>(?:[^<]*<v>([^<]*)<\/v>)?/g;
+    while ((m = re.exec(xml)) !== null) {
+      var ref = m[1], type = m[2] || '', val = m[3] || '';
+      if (type === 's') val = ss[parseInt(val, 10)] || '';
+      ws[ref] = { v: val, w: val };
+    }
+    var dim = xml.match(/<dimension\s+ref="([^"]+)"/);
+    if (dim) ws['!ref'] = dim[1];
+    return ws;
+  },
+  utils: {
+    sheet_to_json: function(ws, opts) {
+      opts = opts || {};
+      var defval = opts.defval !== undefined ? opts.defval : '';
+      if (!ws || !ws['!ref']) return [];
+      var range = ws['!ref'].split(':');
+      if (range.length < 2) return [];
+
+      // Col letter(s) to number
+      function col2num(s) {
+        var n = 0;
+        for (var i = 0; i < s.length; i++) n = n * 26 + s.charCodeAt(i) - 64;
+        return n;
+      }
+      // Number to col letter(s)
+      function num2col(n) {
+        var s = '';
+        while (n > 0) { s = String.fromCharCode(64 + (n % 26 || 26)) + s; n = Math.floor((n - 1) / 26); }
+        return s;
+      }
+      // Parse cell ref
+      function parseRef(ref) {
+        var m = ref.match(/^([A-Z]+)(\d+)$/);
+        return m ? { c: col2num(m[1]), r: parseInt(m[2], 10) } : null;
+      }
+
+      var s = parseRef(range[0]), e = parseRef(range[1]);
+      if (!s || !e) return [];
+
+      // Read header row
+      var headers = [];
+      for (var c = s.c; c <= e.c; c++) {
+        var ref = num2col(c) + s.r;
+        headers.push(ws[ref] ? ws[ref].w : '');
+      }
+
+      var data = [];
+      for (var r = s.r + 1; r <= e.r; r++) {
+        var row = {}, hasVal = false;
+        for (var ci = 0; ci < headers.length; ci++) {
+          var cellRef = num2col(s.c + ci) + r;
+          var v = ws[cellRef] ? ws[cellRef].w : defval;
+          row[headers[ci]] = v;
+          if (v !== '') hasVal = true;
+        }
+        if (hasVal) data.push(row);
+      }
+      return data;
+    }
+  }
+};
+
+</script>
+
+<!-- CDN versions override inline when internet available -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
+
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Rajdhani:wght@400;500;600;700&family=Orbitron:wght@400;700;900&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg-primary: #040d14;
+    --bg-secondary: #071825;
+    --bg-card: #0a1e2e;
+    --bg-card2: #0d2438;
+    --accent-cyan: #00f5ff;
+    --accent-green: #00ff9d;
+    --accent-orange: #ff6b35;
+    --accent-purple: #b347ff;
+    --accent-yellow: #ffd93d;
+    --text-primary: #e8f4fd;
+    --text-secondary: #7ab3c8;
+    --text-dim: #3d6478;
+    --border: #0e3a54;
+    --border-bright: #1a6a8a;
+    --glow-cyan: 0 0 20px rgba(0,245,255,0.3);
+    --glow-green: 0 0 20px rgba(0,255,157,0.3);
+    --glow-orange: 0 0 20px rgba(255,107,53,0.3);
+  }
+
+  * { margin:0; padding:0; box-sizing:border-box; }
+
+  body {
+    font-family: 'Rajdhani', sans-serif;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background: 
+      radial-gradient(ellipse at 20% 20%, rgba(0,245,255,0.04) 0%, transparent 50%),
+      radial-gradient(ellipse at 80% 80%, rgba(179,71,255,0.04) 0%, transparent 50%);
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  /* Scanline overlay */
+  body::after {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background: repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(0,0,0,0.03) 2px, rgba(0,0,0,0.03) 4px);
+    pointer-events: none;
+    z-index: 1;
+  }
+
+  .dashboard { position: relative; z-index: 2; }
+
+  /* HEADER */
+  .header {
+    background: linear-gradient(90deg, #040d14 0%, #071825 50%, #040d14 100%);
+    border-bottom: 1px solid var(--border-bright);
+    padding: 0 32px;
+    height: 64px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    box-shadow: 0 0 40px rgba(0,245,255,0.1);
+  }
+
+  .header-left { display: flex; align-items: center; gap: 16px; }
+
+  .logo-mark {
+    width: 36px; height: 36px;
+    border: 2px solid var(--accent-cyan);
+    display: flex; align-items: center; justify-content: center;
+    font-family: 'Orbitron', monospace;
+    font-size: 14px;
+    color: var(--accent-cyan);
+    box-shadow: var(--glow-cyan);
+    clip-path: polygon(50% 0%, 100% 25%, 100% 75%, 50% 100%, 0% 75%, 0% 25%);
+  }
+
+  .header-title {
+    font-family: 'Orbitron', monospace;
+    font-size: 18px;
+    font-weight: 700;
+    color: var(--accent-cyan);
+    letter-spacing: 3px;
+    text-shadow: var(--glow-cyan);
+  }
+
+  .header-subtitle {
+    font-size: 11px;
+    color: var(--text-secondary);
+    letter-spacing: 4px;
+    text-transform: uppercase;
+  }
+
+  .header-right { display: flex; align-items: center; gap: 20px; }
+
+  .live-indicator {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 11px; color: var(--accent-green);
+    letter-spacing: 2px;
+    font-family: 'Share Tech Mono', monospace;
+  }
+
+  .live-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--accent-green);
+    animation: pulse-green 1.5s infinite;
+  }
+
+  @keyframes pulse-green {
+    0%, 100% { box-shadow: 0 0 4px var(--accent-green); opacity: 1; }
+    50% { box-shadow: 0 0 12px var(--accent-green); opacity: 0.6; }
+  }
+
+  .record-count {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 12px;
+    color: var(--text-secondary);
+    background: var(--bg-card2);
+    border: 1px solid var(--border);
+    padding: 4px 12px;
+    letter-spacing: 1px;
+  }
+
+  /* UPLOAD ZONE */
+  #upload-section {
+    padding: 60px 32px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: calc(100vh - 64px);
+  }
+
+  .upload-zone {
+    width: 100%;
+    max-width: 700px;
+    border: 2px dashed var(--border-bright);
+    background: var(--bg-card);
+    padding: 60px 40px;
+    text-align: center;
+    cursor: pointer;
+    transition: all 0.3s;
+    position: relative;
+    overflow: hidden;
+  }
+
+  .upload-zone::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(135deg, rgba(0,245,255,0.03) 0%, transparent 60%);
+    transition: opacity 0.3s;
+  }
+
+  .upload-zone:hover, .upload-zone.drag-over {
+    border-color: var(--accent-cyan);
+    box-shadow: var(--glow-cyan), inset 0 0 40px rgba(0,245,255,0.05);
+  }
+
+  .upload-icon {
+    font-size: 64px;
+    margin-bottom: 20px;
+    filter: drop-shadow(0 0 12px rgba(0,245,255,0.5));
+  }
+
+  .upload-title {
+    font-family: 'Orbitron', monospace;
+    font-size: 22px;
+    color: var(--accent-cyan);
+    letter-spacing: 2px;
+    margin-bottom: 12px;
+  }
+
+  .upload-sub {
+    color: var(--text-secondary);
+    font-size: 14px;
+    letter-spacing: 1px;
+    margin-bottom: 28px;
+  }
+
+  .upload-formats {
+    display: flex; gap: 12px; justify-content: center; flex-wrap: wrap;
+  }
+
+  .format-badge {
+    background: var(--bg-card2);
+    border: 1px solid var(--border-bright);
+    color: var(--accent-cyan);
+    padding: 6px 16px;
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 12px;
+    letter-spacing: 2px;
+  }
+
+  .upload-btn {
+    margin-top: 28px;
+    display: inline-block;
+    background: transparent;
+    border: 1px solid var(--accent-cyan);
+    color: var(--accent-cyan);
+    padding: 12px 36px;
+    font-family: 'Orbitron', monospace;
+    font-size: 13px;
+    letter-spacing: 3px;
+    cursor: pointer;
+    transition: all 0.3s;
+    text-transform: uppercase;
+  }
+
+  .upload-btn:hover {
+    background: rgba(0,245,255,0.1);
+    box-shadow: var(--glow-cyan);
+  }
+
+  #file-input { display: none; }
+
+  /* MAIN DASHBOARD */
+  #dashboard-section { display: none; padding: 24px 28px; }
+
+  /* FILTERS BAR */
+  .filters-bar {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    padding: 16px 24px;
+    margin-bottom: 24px;
+    display: flex;
+    gap: 16px;
+    flex-wrap: wrap;
+    align-items: flex-end;
+  }
+
+  .filter-group {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .filter-label {
+    font-size: 10px;
+    color: var(--text-dim);
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    font-family: 'Share Tech Mono', monospace;
+  }
+
+  .filter-select, .filter-input {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-bright);
+    color: var(--text-primary);
+    padding: 8px 14px;
+    font-family: 'Rajdhani', sans-serif;
+    font-size: 13px;
+    font-weight: 600;
+    outline: none;
+    min-width: 160px;
+    cursor: pointer;
+    transition: border-color 0.2s;
+  }
+
+  .filter-select:focus, .filter-input:focus {
+    border-color: var(--accent-cyan);
+    box-shadow: 0 0 8px rgba(0,245,255,0.2);
+  }
+
+  .filter-select option { background: var(--bg-secondary); }
+
+  .filter-input { min-width: 140px; }
+
+  .filter-btn {
+    background: linear-gradient(135deg, rgba(0,245,255,0.15), rgba(0,245,255,0.05));
+    border: 1px solid var(--accent-cyan);
+    color: var(--accent-cyan);
+    padding: 8px 24px;
+    font-family: 'Orbitron', monospace;
+    font-size: 11px;
+    letter-spacing: 2px;
+    cursor: pointer;
+    transition: all 0.2s;
+    align-self: flex-end;
+  }
+
+  .filter-btn:hover { box-shadow: var(--glow-cyan); }
+
+  .filter-btn.reset {
+    border-color: var(--accent-orange);
+    color: var(--accent-orange);
+    background: linear-gradient(135deg, rgba(255,107,53,0.1), transparent);
+  }
+
+  /* TIMELINE SLIDER */
+  .timeline-section {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    padding: 16px 24px;
+    margin-bottom: 24px;
+  }
+
+  .timeline-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 12px;
+  }
+
+  .timeline-label {
+    font-family: 'Orbitron', monospace;
+    font-size: 11px;
+    color: var(--accent-cyan);
+    letter-spacing: 3px;
+  }
+
+  .timeline-range-display {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 12px;
+    color: var(--accent-green);
+  }
+
+  .range-slider-container {
+    position: relative;
+    height: 40px;
+    display: flex;
+    align-items: center;
+  }
+
+  .range-track {
+    width: 100%;
+    height: 4px;
+    background: var(--border);
+    position: relative;
+    border-radius: 2px;
+  }
+
+  .range-fill {
+    position: absolute;
+    height: 100%;
+    background: linear-gradient(90deg, var(--accent-cyan), var(--accent-green));
+    border-radius: 2px;
+  }
+
+  input[type="range"] {
+    position: absolute;
+    width: 100%;
+    -webkit-appearance: none;
+    background: transparent;
+    pointer-events: none;
+  }
+
+  input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 18px; height: 18px;
+    background: var(--accent-cyan);
+    border-radius: 2px;
+    cursor: pointer;
+    pointer-events: all;
+    box-shadow: 0 0 8px rgba(0,245,255,0.8);
+    transform: rotate(45deg);
+  }
+
+  /* KPI GRID */
+  .kpi-grid {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 16px;
+    margin-bottom: 24px;
+  }
+  .kpi-grid-2 {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 16px;
+    margin-bottom: 24px;
+  }
+
+  .kpi-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    padding: 20px 18px;
+    position: relative;
+    overflow: hidden;
+    transition: border-color 0.3s, transform 0.2s;
+    cursor: default;
+  }
+
+  .kpi-card:hover {
+    transform: translateY(-2px);
+  }
+
+  .kpi-card::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0;
+    width: 3px;
+    height: 100%;
+  }
+
+  .kpi-card.cyan::before { background: var(--accent-cyan); box-shadow: 4px 0 12px rgba(0,245,255,0.4); }
+  .kpi-card.green::before { background: var(--accent-green); box-shadow: 4px 0 12px rgba(0,255,157,0.4); }
+  .kpi-card.orange::before { background: var(--accent-orange); box-shadow: 4px 0 12px rgba(255,107,53,0.4); }
+  .kpi-card.purple::before { background: var(--accent-purple); box-shadow: 4px 0 12px rgba(179,71,255,0.4); }
+  .kpi-card.yellow::before { background: var(--accent-yellow); box-shadow: 4px 0 12px rgba(255,217,61,0.4); }
+  .kpi-card.teal::before   { background: #00e5cc; box-shadow: 4px 0 12px rgba(0,229,204,0.4); }
+  .kpi-card.pink::before   { background: #ff4d94; box-shadow: 4px 0 12px rgba(255,77,148,0.4); }
+  .kpi-card.indigo::before { background: #7c6fff; box-shadow: 4px 0 12px rgba(124,111,255,0.4); }
+  .kpi-card.lime::before   { background: #aaff00; box-shadow: 4px 0 12px rgba(170,255,0,0.4); }
+
+  .kpi-card:hover { border-color: var(--border-bright); }
+
+  .kpi-label {
+    font-size: 10px;
+    color: var(--text-dim);
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    font-family: 'Share Tech Mono', monospace;
+    margin-bottom: 10px;
+  }
+
+  .kpi-value {
+    font-family: 'Orbitron', monospace;
+    font-size: 26px;
+    font-weight: 700;
+    line-height: 1;
+    margin-bottom: 6px;
+  }
+
+  .kpi-card.cyan .kpi-value { color: var(--accent-cyan); text-shadow: 0 0 20px rgba(0,245,255,0.5); }
+  .kpi-card.green .kpi-value { color: var(--accent-green); text-shadow: 0 0 20px rgba(0,255,157,0.5); }
+  .kpi-card.orange .kpi-value { color: var(--accent-orange); text-shadow: 0 0 20px rgba(255,107,53,0.5); }
+  .kpi-card.purple .kpi-value { color: var(--accent-purple); text-shadow: 0 0 20px rgba(179,71,255,0.5); }
+  .kpi-card.yellow .kpi-value { color: var(--accent-yellow); text-shadow: 0 0 20px rgba(255,217,61,0.5); }
+  .kpi-card.teal   .kpi-value { color: #00e5cc; text-shadow: 0 0 20px rgba(0,229,204,0.5); }
+  .kpi-card.pink   .kpi-value { color: #ff4d94; text-shadow: 0 0 20px rgba(255,77,148,0.5); }
+  .kpi-card.indigo .kpi-value { color: #7c6fff; text-shadow: 0 0 20px rgba(124,111,255,0.5); }
+  .kpi-card.lime   .kpi-value { color: #aaff00; text-shadow: 0 0 20px rgba(170,255,0,0.5); }
+
+  .kpi-sub {
+    font-size: 11px;
+    color: var(--text-secondary);
+    font-family: 'Share Tech Mono', monospace;
+  }
+
+  .kpi-bg-icon {
+    position: absolute;
+    right: 12px; bottom: 8px;
+    font-size: 40px;
+    opacity: 0.08;
+  }
+
+  /* CHARTS GRID */
+  .charts-row {
+    display: grid;
+    gap: 16px;
+    margin-bottom: 20px;
+  }
+
+  .charts-row-3 { grid-template-columns: 1fr 1fr 1fr; }
+  .charts-row-2 { grid-template-columns: 1.4fr 1fr; }
+
+  .chart-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    padding: 20px;
+    position: relative;
+    overflow: hidden;
+  }
+
+  .chart-card::after {
+    content: '';
+    position: absolute;
+    top: 0; right: 0;
+    width: 60px; height: 60px;
+    background: radial-gradient(circle, rgba(0,245,255,0.05) 0%, transparent 70%);
+  }
+
+  .chart-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    margin-bottom: 16px;
+  }
+
+  .chart-title {
+    font-family: 'Orbitron', monospace;
+    font-size: 11px;
+    letter-spacing: 2px;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+  }
+
+  .chart-badge {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 10px;
+    color: var(--accent-cyan);
+    background: rgba(0,245,255,0.08);
+    border: 1px solid rgba(0,245,255,0.2);
+    padding: 2px 8px;
+    letter-spacing: 1px;
+  }
+
+  .chart-container { position: relative; }
+
+  /* ── GEO MAP CARD ─────────────────────────────────────────── */
+  .map-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    padding: 20px;
+    position: relative;
+    overflow: hidden;
+    cursor: default;
+    transition: border-color 0.2s, box-shadow 0.2s;
+  }
+  .map-card:hover { border-color: var(--border-bright); box-shadow: 0 0 20px rgba(0,245,255,0.08); }
+  .map-card::after {
+    content: '';
+    position: absolute;
+    top: 0; right: 0;
+    width: 60px; height: 60px;
+    background: radial-gradient(circle, rgba(0,245,255,0.05) 0%, transparent 70%);
+    pointer-events: none;
+  }
+  #geo-map-container {
+    width: 100%;
+  }
+  #geo-map {
+    width: 100%;
+    height: 242px;
+    border: 1px solid var(--border);
+    background: #071825;
+    z-index: 1;
+    display: block;
+  }
+  .geo-no-data {
+    height: 242px;
+  }
+  /* Override Leaflet defaults to match dark theme */
+  .leaflet-container { background: #071825 !important; font-family: 'Share Tech Mono', monospace; }
+  .leaflet-tile-pane { filter: brightness(0.85) saturate(0.7) hue-rotate(180deg) invert(1); }
+  .leaflet-control-attribution { background: rgba(7,24,37,0.85) !important; color: #3d6478 !important; font-size: 9px; }
+  .leaflet-control-attribution a { color: #1a6a8a !important; }
+  .leaflet-control-zoom a {
+    background: #0a1e2e !important; color: #00f5ff !important;
+    border-color: #1a6a8a !important;
+  }
+  .leaflet-control-zoom a:hover { background: #0d2438 !important; }
+  .geo-map-legend {
+    display: flex; gap: 16px; flex-wrap: wrap;
+    margin-top: 10px;
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 10px; color: var(--text-secondary);
+    letter-spacing: 1px;
+  }
+  .geo-map-legend span { display: flex; align-items: center; gap: 5px; }
+  .geo-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
+  .geo-no-data {
+    height: 242px;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    gap: 10px;
+    color: var(--text-dim);
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 12px; letter-spacing: 2px;
+    border: 1px solid var(--border);
+  }
+
+  /* DEEP ANALYSIS */
+  .analysis-section {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    padding: 24px;
+    margin-bottom: 24px;
+  }
+
+  .analysis-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 20px;
+    padding-bottom: 16px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .analysis-title {
+    font-family: 'Orbitron', monospace;
+    font-size: 14px;
+    letter-spacing: 3px;
+    color: var(--accent-purple);
+    text-shadow: 0 0 12px rgba(179,71,255,0.4);
+  }
+
+  .analysis-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 16px;
+  }
+
+  .analysis-card {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    padding: 16px;
+    position: relative;
+  }
+
+  .analysis-card-title {
+    font-size: 10px;
+    color: var(--text-dim);
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    font-family: 'Share Tech Mono', monospace;
+    margin-bottom: 12px;
+  }
+
+  .analysis-list { list-style: none; }
+
+  .analysis-list li {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 7px 0;
+    border-bottom: 1px solid rgba(14,58,84,0.5);
+    font-size: 13px;
+    font-weight: 600;
+  }
+
+  .analysis-list li:last-child { border-bottom: none; }
+
+  .analysis-list .val {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 12px;
+  }
+
+  .analysis-list .val.cyan { color: var(--accent-cyan); }
+  .analysis-list .val.green { color: var(--accent-green); }
+  .analysis-list .val.orange { color: var(--accent-orange); }
+  .analysis-list .val.yellow { color: var(--accent-yellow); }
+
+  /* DATA TABLE */
+  .table-section {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    padding: 24px;
+    margin-bottom: 24px;
+  }
+
+  .table-header-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 16px;
+  }
+
+  .search-box {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-bright);
+    color: var(--text-primary);
+    padding: 8px 16px;
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 12px;
+    width: 280px;
+    outline: none;
+  }
+
+  .search-box::placeholder { color: var(--text-dim); }
+  .search-box:focus { border-color: var(--accent-cyan); }
+
+  .data-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+    font-family: 'Share Tech Mono', monospace;
+  }
+
+  .data-table th {
+    text-align: left;
+    padding: 10px 12px;
+    background: var(--bg-secondary);
+    color: var(--text-dim);
+    font-size: 10px;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    border-bottom: 1px solid var(--border-bright);
+    white-space: nowrap;
+    cursor: pointer;
+    user-select: none;
+  }
+
+  .data-table th:hover { color: var(--accent-cyan); }
+
+  .data-table td {
+    padding: 9px 12px;
+    border-bottom: 1px solid rgba(14,58,84,0.4);
+    color: var(--text-secondary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 180px;
+  }
+
+  .data-table tr:hover td { background: rgba(0,245,255,0.03); color: var(--text-primary); }
+
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    border-radius: 2px;
+  }
+
+  .badge-voice { background: rgba(0,245,255,0.15); color: var(--accent-cyan); border: 1px solid rgba(0,245,255,0.3); }
+  .badge-sms { background: rgba(0,255,157,0.15); color: var(--accent-green); border: 1px solid rgba(0,255,157,0.3); }
+  .badge-data { background: rgba(179,71,255,0.15); color: var(--accent-purple); border: 1px solid rgba(179,71,255,0.3); }
+  .badge-roaming { background: rgba(255,107,53,0.2); color: var(--accent-orange); border: 1px solid rgba(255,107,53,0.3); }
+
+  .pagination {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+    margin-top: 16px;
+    align-items: center;
+  }
+
+  .page-btn {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+    padding: 6px 12px;
+    cursor: pointer;
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 11px;
+    transition: all 0.2s;
+  }
+
+  .page-btn:hover, .page-btn.active { border-color: var(--accent-cyan); color: var(--accent-cyan); }
+
+  .page-info {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 11px;
+    color: var(--text-dim);
+  }
+
+  /* SECTION SEPARATOR */
+  .section-sep {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 20px;
+  }
+
+  .sep-line { flex: 1; height: 1px; background: var(--border); }
+  .sep-text {
+    font-family: 'Orbitron', monospace;
+    font-size: 11px;
+    letter-spacing: 3px;
+    color: var(--text-dim);
+    white-space: nowrap;
+  }
+
+  /* LOADING */
+  #loading {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(4,13,20,0.9);
+    z-index: 999;
+    align-items: center;
+    justify-content: center;
+    flex-direction: column;
+    gap: 20px;
+  }
+
+  .loader-ring {
+    width: 60px; height: 60px;
+    border: 3px solid var(--border);
+    border-top-color: var(--accent-cyan);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .loader-text {
+    font-family: 'Orbitron', monospace;
+    font-size: 13px;
+    letter-spacing: 4px;
+    color: var(--accent-cyan);
+    animation: flicker 1.5s infinite;
+  }
+
+  @keyframes flicker {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+  }
+
+  /* Scrollbar */
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: var(--bg-primary); }
+  ::-webkit-scrollbar-thumb { background: var(--border-bright); }
+  ::-webkit-scrollbar-thumb:hover { background: var(--accent-cyan); }
+
+  /* ── CALL TYPE MAPPER MODAL ─────────────────────────────────────────── */
+  .ctmap-overlay {
+    display: none; position: fixed; inset: 0; z-index: 700;
+    background: rgba(4,13,20,0.96);
+    backdrop-filter: blur(10px);
+    align-items: center; justify-content: center;
+  }
+  .ctmap-overlay.open { display: flex; }
+
+  .ctmap-box {
+    background: var(--bg-card);
+    border: 1px solid var(--accent-cyan);
+    box-shadow: 0 0 60px rgba(0,245,255,0.18);
+    width: 94vw; max-width: 780px;
+    max-height: 90vh;
+    display: flex; flex-direction: column;
+    animation: modal-in 0.25s ease;
+    overflow: hidden;
+  }
+
+  .ctmap-head {
+    background: linear-gradient(135deg, rgba(0,245,255,0.1) 0%, transparent 60%);
+    border-bottom: 1px solid rgba(0,245,255,0.25);
+    padding: 18px 26px 14px;
+    flex-shrink: 0;
+  }
+
+  .ctmap-title {
+    font-family: 'Orbitron', monospace;
+    font-size: 13px; letter-spacing: 3px;
+    color: var(--accent-cyan);
+    text-shadow: 0 0 16px rgba(0,245,255,0.4);
+    display: block; margin-bottom: 6px;
+  }
+
+  .ctmap-subtitle {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 11px; color: var(--text-secondary); letter-spacing: 1px;
+  }
+
+  .ctmap-body {
+    overflow-y: auto; flex: 1;
+    padding: 20px 26px;
+  }
+
+  .ctmap-table {
+    width: 100%; border-collapse: collapse;
+  }
+
+  .ctmap-table th {
+    text-align: left; padding: 10px 14px;
+    background: var(--bg-secondary);
+    color: var(--text-dim);
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 10px; letter-spacing: 2px; text-transform: uppercase;
+    border-bottom: 1px solid var(--border-bright);
+  }
+
+  .ctmap-table td {
+    padding: 8px 14px;
+    border-bottom: 1px solid rgba(14,58,84,0.4);
+    vertical-align: middle;
+  }
+
+  .ctmap-table tr:hover td { background: rgba(0,245,255,0.03); }
+
+  .ctmap-raw {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 12px; color: var(--text-primary);
+  }
+
+  .ctmap-count {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 11px; color: var(--accent-cyan);
+    text-align: right;
+  }
+
+  .ctmap-select {
+    width: 100%;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-bright);
+    color: var(--text-primary);
+    padding: 7px 12px;
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 12px; outline: none;
+    cursor: pointer;
+    transition: border-color 0.2s;
+  }
+  .ctmap-select:focus { border-color: var(--accent-cyan); }
+  .ctmap-select option { background: var(--bg-secondary); }
+
+  .ctmap-select.mapped-in-call  { border-color: #00e5cc; color: #00e5cc; }
+  .ctmap-select.mapped-out-call { border-color: #ff4d94; color: #ff4d94; }
+  .ctmap-select.mapped-in-sms   { border-color: #7c6fff; color: #7c6fff; }
+  .ctmap-select.mapped-out-sms  { border-color: #aaff00; color: #aaff00; }
+  .ctmap-select.mapped-unknown  { border-color: var(--text-dim); color: var(--text-dim); }
+
+  .ctmap-footer {
+    padding: 16px 26px;
+    border-top: 1px solid rgba(0,245,255,0.15);
+    display: flex; gap: 12px; align-items: center;
+    flex-shrink: 0;
+    background: rgba(4,13,20,0.4);
+  }
+
+  .ctmap-btn-primary {
+    background: linear-gradient(135deg, rgba(0,245,255,0.2), rgba(0,245,255,0.07));
+    border: 1px solid var(--accent-cyan); color: var(--accent-cyan);
+    padding: 10px 32px;
+    font-family: 'Orbitron', monospace; font-size: 11px; letter-spacing: 2px;
+    cursor: pointer; transition: all 0.2s;
+  }
+  .ctmap-btn-primary:hover { box-shadow: var(--glow-cyan); }
+
+  .ctmap-btn-auto {
+    background: transparent;
+    border: 1px solid var(--border-bright); color: var(--text-secondary);
+    padding: 10px 20px;
+    font-family: 'Share Tech Mono', monospace; font-size: 11px; letter-spacing: 1px;
+    cursor: pointer; transition: all 0.2s;
+  }
+  .ctmap-btn-auto:hover { border-color: var(--accent-green); color: var(--accent-green); }
+
+  .ctmap-hint {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 10px; color: var(--text-dim);
+    margin-left: auto; letter-spacing: 1px;
+  }
+
+  /* ── DRILL-DOWN MODAL ─────────────────────────────────────────── */
+  .modal-overlay {
+    display: none;
+    position: fixed; inset: 0; z-index: 500;
+    background: rgba(4,13,20,0.88);
+    backdrop-filter: blur(4px);
+    align-items: center; justify-content: center;
+  }
+  .modal-overlay.open { display: flex; }
+
+  .modal-box {
+    background: var(--bg-card);
+    border: 1px solid var(--border-bright);
+    box-shadow: 0 0 60px rgba(0,245,255,0.15), 0 0 0 1px rgba(0,245,255,0.05);
+    width: 92vw; max-width: 1200px;
+    max-height: 88vh;
+    display: flex; flex-direction: column;
+    animation: modal-in 0.22s ease;
+  }
+
+  @keyframes modal-in {
+    from { opacity:0; transform: translateY(20px) scale(0.97); }
+    to   { opacity:1; transform: translateY(0) scale(1); }
+  }
+
+  .modal-head {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 16px 24px;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+
+  .modal-title {
+    font-family: 'Orbitron', monospace;
+    font-size: 13px; letter-spacing: 3px;
+    color: var(--accent-cyan);
+    text-shadow: var(--glow-cyan);
+  }
+
+  .modal-meta {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 11px; color: var(--accent-green);
+    margin-left: 16px;
+  }
+
+  .modal-close {
+    background: transparent;
+    border: 1px solid var(--border-bright);
+    color: var(--text-secondary);
+    width: 32px; height: 32px;
+    cursor: pointer; font-size: 16px;
+    display: flex; align-items: center; justify-content: center;
+    transition: all 0.2s;
+    font-family: 'Share Tech Mono', monospace;
+  }
+  .modal-close:hover { border-color: var(--accent-orange); color: var(--accent-orange); }
+
+  .modal-search-bar {
+    padding: 12px 24px;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+    display: flex; gap: 12px; align-items: center;
+  }
+
+  .modal-search {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-bright);
+    color: var(--text-primary);
+    padding: 7px 14px;
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 12px; outline: none;
+    width: 260px;
+  }
+  .modal-search:focus { border-color: var(--accent-cyan); }
+  .modal-search::placeholder { color: var(--text-dim); }
+
+  .modal-export {
+    background: transparent;
+    border: 1px solid var(--accent-green);
+    color: var(--accent-green);
+    padding: 7px 18px;
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 11px; letter-spacing: 1px; cursor: pointer;
+    transition: all 0.2s;
+  }
+  .modal-export:hover { background: rgba(0,255,157,0.08); }
+
+  .modal-body {
+    overflow: auto; flex: 1;
+    padding: 0 24px 20px;
+  }
+
+  .modal-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+    font-family: 'Share Tech Mono', monospace;
+    margin-top: 12px;
+  }
+
+  .modal-table th {
+    text-align: left; padding: 10px 12px;
+    background: var(--bg-secondary);
+    color: var(--text-dim); font-size: 10px;
+    letter-spacing: 1px; text-transform: uppercase;
+    border-bottom: 1px solid var(--border-bright);
+    white-space: nowrap; position: sticky; top: 0;
+    cursor: pointer; user-select: none;
+  }
+  .modal-table th:hover { color: var(--accent-cyan); }
+
+  .modal-table td {
+    padding: 8px 12px;
+    border-bottom: 1px solid rgba(14,58,84,0.4);
+    color: var(--text-secondary);
+    white-space: nowrap; max-width: 200px;
+    overflow: hidden; text-overflow: ellipsis;
+  }
+  .modal-table tr:hover td { background: rgba(0,245,255,0.04); color: var(--text-primary); }
+
+  /* Make charts & analysis items show pointer */
+  .chart-card { cursor: pointer; transition: border-color 0.2s, box-shadow 0.2s; }
+  .chart-card:hover { border-color: var(--accent-cyan); box-shadow: 0 0 20px rgba(0,245,255,0.12); }
+  .chart-card .click-hint {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 9px; color: var(--text-dim);
+    letter-spacing: 1px; margin-top: 2px;
+  }
+
+  .analysis-list li { cursor: pointer; border-radius: 2px; padding: 7px 4px; transition: background 0.15s; }
+  .analysis-list li:hover { background: rgba(0,245,255,0.06); }
+  .analysis-list li .row-label { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+
+  .no-data {
+    text-align: center;
+    padding: 40px;
+    color: var(--text-dim);
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 13px;
+  }
+
+  /* Responsive */
+  @media (max-width: 1400px) {
+    .kpi-grid { grid-template-columns: repeat(3, 1fr); }
+    .kpi-grid-2 { grid-template-columns: repeat(2, 1fr); }
+    .charts-row-3 { grid-template-columns: 1fr 1fr; }
+    .analysis-grid { grid-template-columns: repeat(2, 1fr); }
+  }
+
+  @media (max-width: 900px) {
+    .kpi-grid { grid-template-columns: repeat(2, 1fr); }
+    .kpi-grid-2 { grid-template-columns: repeat(2, 1fr); }
+    .charts-row-2, .charts-row-3 { grid-template-columns: 1fr; }
+  }
+
+  /* ── PDF DOWNLOAD BUTTON ───────────────────────────────────────── */
+  .pdf-btn {
+    display: flex; align-items: center; gap: 8px;
+    background: linear-gradient(135deg, rgba(255,107,53,0.18), rgba(255,107,53,0.05));
+    border: 1px solid var(--accent-orange);
+    color: var(--accent-orange);
+    padding: 8px 22px;
+    font-family: 'Orbitron', monospace;
+    font-size: 11px; letter-spacing: 2px;
+    cursor: pointer; transition: all 0.25s;
+    margin-top: 0;
+  }
+  .pdf-btn:hover { box-shadow: var(--glow-orange); background: rgba(255,107,53,0.2); }
+  .pdf-btn svg { flex-shrink:0; }
+
+  /* ── SHOW MORE TABLE BUTTON ─────────────────────────────────────── */
+  .show-more-btn {
+    background: transparent;
+    border: 1px dashed var(--border-bright);
+    color: var(--text-secondary);
+    padding: 8px 24px;
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 11px; letter-spacing: 1px;
+    cursor: pointer; transition: all 0.2s;
+    display: block; margin: 14px auto 0;
+  }
+  .show-more-btn:hover { border-color: var(--accent-cyan); color: var(--accent-cyan); }
+
+  /* ── CONTACT MODAL ───────────────────────────────────────────── */
+  .contact-overlay {
+    display: none; position: fixed; inset: 0; z-index: 600;
+    background: rgba(4,13,20,0.93);
+    backdrop-filter: blur(8px);
+    align-items: center; justify-content: center;
+  }
+  .contact-overlay.open { display: flex; }
+
+  .contact-box {
+    background: var(--bg-card);
+    border: 1px solid rgba(255,107,53,0.6);
+    box-shadow: 0 0 70px rgba(255,107,53,0.18), inset 0 0 40px rgba(255,107,53,0.02);
+    width: 94vw; max-width: 540px;
+    animation: modal-in 0.25s ease;
+    overflow: hidden;
+    position: relative;
+  }
+  .contact-box::before {
+    content: '';
+    position: absolute; top: 0; left: 0; right: 0; height: 2px;
+    background: linear-gradient(90deg, transparent, var(--accent-orange), var(--accent-yellow), var(--accent-orange), transparent);
+  }
+
+  .contact-head {
+    background: linear-gradient(135deg, rgba(255,107,53,0.1) 0%, transparent 60%);
+    border-bottom: 1px solid rgba(255,107,53,0.2);
+    padding: 20px 28px 16px;
+  }
+  .contact-title {
+    font-family: 'Orbitron', monospace;
+    font-size: 14px; letter-spacing: 3px;
+    color: var(--accent-orange);
+    text-shadow: 0 0 20px rgba(255,107,53,0.4);
+    display: block; margin-bottom: 6px;
+  }
+  .contact-subtitle {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 11px; color: var(--text-secondary); letter-spacing: 1px;
+  }
+
+  .contact-body { padding: 22px 28px 0; }
+
+  .contact-row-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 14px; }
+  .contact-row-1 { margin-bottom: 14px; }
+
+  .c-field label {
+    display: block;
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 9px; color: rgba(255,107,53,0.85);
+    letter-spacing: 2px; text-transform: uppercase; margin-bottom: 7px;
+  }
+  .c-field input {
+    width: 100%;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-bright);
+    color: var(--text-primary);
+    padding: 11px 14px;
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 13px; outline: none;
+    transition: border-color 0.2s, box-shadow 0.2s;
+  }
+  .c-field input:focus {
+    border-color: var(--accent-orange);
+    box-shadow: 0 0 12px rgba(255,107,53,0.15);
+  }
+  .c-field input::placeholder { color: var(--text-dim); font-size: 12px; }
+  .c-field input.err-field { border-color: rgba(255,80,53,0.9); }
+
+  .contact-divider {
+    height: 1px;
+    background: linear-gradient(90deg, transparent, rgba(255,107,53,0.2), transparent);
+    margin: 4px 0 18px;
+  }
+
+  .contact-footer {
+    padding: 16px 28px 22px;
+    display: flex; flex-direction: column; align-items: stretch; gap: 10px;
+  }
+  .contact-submit-btn {
+    background: linear-gradient(135deg, rgba(255,107,53,0.22) 0%, rgba(255,107,53,0.08) 100%);
+    border: 1px solid var(--accent-orange);
+    color: var(--accent-orange);
+    padding: 14px 28px;
+    font-family: 'Orbitron', monospace;
+    font-size: 12px; letter-spacing: 3px;
+    cursor: pointer; transition: all 0.25s;
+    text-align: center;
+  }
+  .contact-submit-btn:hover { box-shadow: 0 0 28px rgba(255,107,53,0.35); }
+  .contact-submit-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  .contact-status {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 11px; text-align: center;
+    min-height: 18px; letter-spacing: 1px;
+  }
+  .contact-status.ok  { color: var(--accent-green); }
+  .contact-status.err { color: #ff8060; }
+
+  .contact-privacy {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 9px; color: var(--text-dim);
+    letter-spacing: 1px; text-align: center;
+  }
+
+  /* ── TOP REPORT TABLES (PDF-priority) ─────────────────────────── */
+  .report-tables-section {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    padding: 24px;
+    margin-bottom: 24px;
+  }
+
+  .report-tables-header {
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 18px; flex-wrap: wrap; gap: 12px;
+  }
+
+  .report-tabs {
+    display: flex; gap: 6px; flex-wrap: wrap;
+  }
+
+  .rtab {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    padding: 6px 14px;
+    font-family: 'Share Tech Mono', monospace; font-size: 10px;
+    letter-spacing: 1px; cursor: pointer; transition: all 0.2s;
+  }
+  .rtab.active, .rtab:hover {
+    border-color: var(--accent-cyan); color: var(--accent-cyan);
+    background: rgba(0,245,255,0.06);
+  }
+
+  .report-table-wrap { overflow-x: auto; }
+
+  .report-table {
+    width: 100%; border-collapse: collapse;
+    font-size: 12px; font-family: 'Share Tech Mono', monospace;
+  }
+  .report-table th {
+    text-align: left; padding: 9px 12px;
+    background: var(--bg-secondary); color: var(--text-dim);
+    font-size: 10px; letter-spacing: 1px; text-transform: uppercase;
+    border-bottom: 1px solid var(--border-bright);
+    white-space: nowrap;
+  }
+  .report-table td {
+    padding: 8px 12px; border-bottom: 1px solid rgba(14,58,84,0.4);
+    color: var(--text-secondary); white-space: nowrap;
+  }
+  .report-table tr:hover td { background: rgba(0,245,255,0.03); color: var(--text-primary); }
+  .report-table .rank { color: var(--accent-cyan); font-weight: bold; }
+  .report-table .num { color: var(--accent-green); }
+  .report-table .dur-val { color: var(--accent-yellow); }
+  .report-table .cell-val { color: var(--accent-orange); }
+</style>
+</head>
+<body>
+
+<div id="loading">
+  <div class="loader-ring"></div>
+  <div class="loader-text">PROCESSING DATA...</div>
+</div>
+
+<div class="dashboard">
+  <!-- HEADER -->
+  <header class="header">
+    <div class="header-left">
+      <div class="logo-mark">CDR</div>
+      <div>
+        <div class="header-title">CDR INTELLIGENCE</div>
+        <div class="header-subtitle">Call Detail Record Analytics Platform</div>
+      </div>
+    </div>
+    <div class="header-right">
+      <div class="live-indicator"><div class="live-dot"></div>SYSTEM ACTIVE</div>
+      <div class="record-count" id="record-count">0 RECORDS</div>
+      <button class="pdf-btn" onclick="triggerDownload()">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14,2 14,8 20,8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10,9 9,9 8,9"/></svg>
+        DOWNLOAD REPORT
+      </button>
+      <button class="upload-btn" style="margin-top:0;padding:8px 20px;font-size:11px;" onclick="document.getElementById('file-input').click()">↑ RELOAD</button>
+      <input type="file" id="file-input" accept=".csv,.xlsx,.xls" onchange="handleFile(event)">
+    </div>
+  </header>
+
+  <!-- UPLOAD SECTION -->
+  <section id="upload-section">
+    <div class="upload-zone" id="drop-zone"
+      ondragover="event.preventDefault(); this.classList.add('drag-over')"
+      ondragleave="this.classList.remove('drag-over')"
+      ondrop="handleDrop(event)">
+      <div class="upload-icon">📡</div>
+      <div class="upload-title">UPLOAD CDR DATASET</div>
+      <div class="upload-sub">Drag & drop your file or click to browse</div>
+      <div class="upload-formats">
+        <span class="format-badge">CSV</span>
+        <span class="format-badge">XLSX</span>
+        <span class="format-badge">XLS</span>
+      </div>
+      <button class="upload-btn" onclick="document.getElementById('file-input').click()">SELECT FILE</button>
+      <input type="file" id="file-input" accept=".csv,.xlsx,.xls" onchange="handleFile(event)">
+    </div>
+    <div style="margin-top:24px; font-family:'Share Tech Mono',monospace; font-size:12px; color:var(--text-dim); text-align:center; max-width:600px;">
+      Expected columns: A PARTY · B PARTY · DATE · TIME · DURATION · CALL TYPE · CELL ID · IMEI · IMSI · ADDRESS · ROAMING · LATITUDE · LONGITUDE
+    </div>
+  </section>
+
+  <!-- DASHBOARD SECTION -->
+  <section id="dashboard-section">
+
+    <!-- FILTERS -->
+    <div class="filters-bar">
+      <div class="filter-group">
+        <span class="filter-label">Call Type</span>
+        <select class="filter-select" id="f-call-type" onchange="applyFilters()">
+          <option value="">ALL TYPES</option>
+        </select>
+      </div>
+      <div class="filter-group">
+        <span class="filter-label">Roaming</span>
+        <select class="filter-select" id="f-roaming" onchange="applyFilters()">
+          <option value="">ALL</option>
+          <option value="yes">ROAMING</option>
+          <option value="no">LOCAL</option>
+        </select>
+      </div>
+      <div class="filter-group">
+        <span class="filter-label">A Party (Subscriber)</span>
+        <input class="filter-input" type="text" id="f-aparty" placeholder="Search number..." oninput="applyFilters()">
+      </div>
+      <div class="filter-group">
+        <span class="filter-label">B Party (Called)</span>
+        <input class="filter-input" type="text" id="f-bparty" placeholder="Search number..." oninput="applyFilters()">
+      </div>
+      <div class="filter-group">
+        <span class="filter-label">Cell ID</span>
+        <select class="filter-select" id="f-cellid" onchange="applyFilters()">
+          <option value="">ALL CELLS</option>
+        </select>
+      </div>
+      <div class="filter-group">
+        <span class="filter-label">IMEI</span>
+        <input class="filter-input" type="text" id="f-imei" placeholder="Device IMEI..." oninput="applyFilters()">
+      </div>
+      <button class="filter-btn" onclick="resetFilters()">⟳ RESET</button>
+    </div>
+
+    <!-- TIMELINE -->
+    <div class="timeline-section">
+      <div class="timeline-header">
+        <span class="timeline-label">◈ TIMELINE FILTER</span>
+        <span class="timeline-range-display" id="timeline-display">ALL DATES</span>
+      </div>
+      <div class="range-slider-container">
+        <div class="range-track">
+          <div class="range-fill" id="range-fill"></div>
+        </div>
+        <input type="range" id="timeline-start" min="0" max="100" value="0" oninput="updateTimeline()">
+        <input type="range" id="timeline-end" min="0" max="100" value="100" oninput="updateTimeline()">
+      </div>
+    </div>
+
+    <!-- ══════════════════════════════════════════════════════════════
+         PRIORITY 1 — TABLE FORMAT REPORTS
+    ══════════════════════════════════════════════════════════════ -->
+    <div class="section-sep">
+      <div class="sep-line"></div><div class="sep-text">TABLE FORMAT REPORTS</div><div class="sep-line"></div>
+    </div>
+
+    <!-- TOP SUMMARY REPORT TABLES -->
+    <div class="report-tables-section" id="report-tables-section">
+      <div class="report-tables-header">
+        <div style="display:flex;align-items:center;gap:12px;">
+          <div style="width:6px;height:20px;background:var(--accent-cyan);box-shadow:0 0 8px var(--accent-cyan);"></div>
+          <span style="font-family:'Orbitron',monospace;font-size:13px;letter-spacing:3px;color:var(--accent-cyan);">◈ INTELLIGENCE REPORT TABLES</span>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+          <div class="report-tabs">
+            <button class="rtab active" onclick="switchReportTab('top-calling-tab',this)">TOP CALLING</button>
+            <button class="rtab" onclick="switchReportTab('top-called-tab',this)">TOP CALLED</button>
+            <button class="rtab" onclick="switchReportTab('top-cells-tab',this)">CELL TOWERS</button>
+            <button class="rtab" onclick="switchReportTab('imei-tab',this)">TOP IMEI</button>
+            <button class="rtab" onclick="switchReportTab('top-location-tab',this)">TOP LOCATIONS</button>
+            <button class="rtab" onclick="switchReportTab('longest-calls-tab',this)">LONGEST CALLS</button>
+          </div>
+          <div style="display:flex;gap:6px;">
+            <button class="show-more-btn" id="top10-btn" style="margin:0;padding:6px 14px;font-size:10px;border-style:solid;border-color:var(--accent-cyan);color:var(--accent-cyan);background:rgba(0,245,255,0.08);" onclick="setTopN(10)">TOP 10</button>
+            <button class="show-more-btn" id="top20-btn" style="margin:0;padding:6px 14px;font-size:10px;" onclick="setTopN(20)">TOP 20</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Top Calling Numbers (A Party) -->
+      <div id="top-calling-tab" class="report-tab-content">
+        <div class="report-table-wrap">
+          <table class="report-table" id="rt-calling">
+            <thead><tr>
+              <th>#</th><th>CALLING NUMBER (A PARTY)</th><th>TOTAL CALLS MADE</th><th>TOTAL DURATION</th><th>AVG DURATION</th><th>UNIQUE CALLED NUMBERS</th><th>ROAMING CALLS</th><th>CALL TYPES</th>
+            </tr></thead>
+            <tbody id="rt-calling-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Most Called B-Parties -->
+      <div id="top-called-tab" class="report-tab-content" style="display:none;">
+        <div class="report-table-wrap">
+          <table class="report-table" id="rt-called">
+            <thead><tr>
+              <th>#</th><th>B PARTY (CALLED)</th><th>TIMES CALLED</th><th>TOTAL DURATION</th><th>UNIQUE CALLERS</th><th>FIRST SEEN</th><th>LAST SEEN</th><th>CALL TYPES</th>
+            </tr></thead>
+            <tbody id="rt-called-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Cell Towers -->
+      <div id="top-cells-tab" class="report-tab-content" style="display:none;">
+        <div class="report-table-wrap">
+          <table class="report-table" id="rt-cells">
+            <thead><tr>
+              <th>#</th><th>CELL ID</th><th>ADDRESS</th><th>TOTAL HITS</th><th>UNIQUE SUBSCRIBERS</th><th>TOTAL DURATION</th><th>ROAMING HITS</th><th>CALL TYPES</th>
+            </tr></thead>
+            <tbody id="rt-cells-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Longest Calls -->
+      <div id="longest-calls-tab" class="report-tab-content" style="display:none;">
+        <div class="report-table-wrap">
+          <table class="report-table" id="rt-longest">
+            <thead><tr>
+              <th>#</th><th>A PARTY</th><th>B PARTY</th><th>DATE</th><th>TIME</th><th>DURATION</th><th>CELL ID</th><th>CALL TYPE</th>
+            </tr></thead>
+            <tbody id="rt-longest-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- IMEI Devices -->
+      <div id="imei-tab" class="report-tab-content" style="display:none;">
+        <div class="report-table-wrap">
+          <table class="report-table" id="rt-imei">
+            <thead><tr>
+              <th>#</th><th>IMEI</th><th>IMSI</th><th>TOTAL CALLS</th><th>UNIQUE SUBSCRIBERS</th><th>TOTAL DURATION</th><th>ROAMING</th><th>LAST SEEN DATE</th>
+            </tr></thead>
+            <tbody id="rt-imei-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Top Locations (by Address) -->
+      <div id="top-location-tab" class="report-tab-content" style="display:none;">
+        <div class="report-table-wrap">
+          <table class="report-table" id="rt-location">
+            <thead><tr>
+              <th>#</th><th>LOCATION / ADDRESS</th><th>TOTAL ACTIVITY</th><th>UNIQUE SUBSCRIBERS</th><th>UNIQUE CELL IDs</th><th>TOTAL DURATION</th><th>ROAMING HITS</th><th>DOMINANT CALL TYPE</th>
+            </tr></thead>
+            <tbody id="rt-location-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </div><!-- /report-tables-section -->
+
+    <!-- KPIs -->
+    <div class="section-sep">
+      <div class="sep-line"></div><div class="sep-text">KEY PERFORMANCE INDICATORS</div><div class="sep-line"></div>
+    </div>
+
+    <!-- Row 1: Core stats -->
+    <div class="kpi-grid">
+      <div class="kpi-card cyan">
+        <div class="kpi-label">Total Records</div>
+        <div class="kpi-value" id="kpi-total">0</div>
+        <div class="kpi-sub" id="kpi-total-sub">CDR entries</div>
+        <div class="kpi-bg-icon">📋</div>
+      </div>
+      <div class="kpi-card green">
+        <div class="kpi-label">Avg Duration</div>
+        <div class="kpi-value" id="kpi-avg-dur">0s</div>
+        <div class="kpi-sub" id="kpi-dur-sub">per call</div>
+        <div class="kpi-bg-icon">⏱</div>
+      </div>
+      <div class="kpi-card orange">
+        <div class="kpi-label">Unique Subscribers</div>
+        <div class="kpi-value" id="kpi-subscribers">0</div>
+        <div class="kpi-sub" id="kpi-subs-sub">A party numbers</div>
+        <div class="kpi-bg-icon">👥</div>
+      </div>
+      <div class="kpi-card purple">
+        <div class="kpi-label">Roaming Calls</div>
+        <div class="kpi-value" id="kpi-roaming">0%</div>
+        <div class="kpi-sub" id="kpi-roam-sub">of total traffic</div>
+        <div class="kpi-bg-icon">🌐</div>
+      </div>
+      <div class="kpi-card yellow">
+        <div class="kpi-label">Unique Cell IDs</div>
+        <div class="kpi-value" id="kpi-cells">0</div>
+        <div class="kpi-sub" id="kpi-cells-sub">towers active</div>
+        <div class="kpi-bg-icon">📡</div>
+      </div>
+    </div>
+
+    <!-- Row 2: Call & Message direction breakdown -->
+    <div class="kpi-grid-2">
+      <div class="kpi-card teal">
+        <div class="kpi-label">Incoming Calls</div>
+        <div class="kpi-value" id="kpi-in-calls">0</div>
+        <div class="kpi-sub" id="kpi-in-calls-sub">received calls</div>
+        <div class="kpi-bg-icon">📲</div>
+      </div>
+      <div class="kpi-card pink">
+        <div class="kpi-label">Outgoing Calls</div>
+        <div class="kpi-value" id="kpi-out-calls">0</div>
+        <div class="kpi-sub" id="kpi-out-calls-sub">dialled calls</div>
+        <div class="kpi-bg-icon">📞</div>
+      </div>
+      <div class="kpi-card indigo">
+        <div class="kpi-label">Incoming Messages</div>
+        <div class="kpi-value" id="kpi-in-sms">0</div>
+        <div class="kpi-sub" id="kpi-in-sms-sub">received SMS</div>
+        <div class="kpi-bg-icon">📩</div>
+      </div>
+      <div class="kpi-card lime">
+        <div class="kpi-label">Outgoing Messages</div>
+        <div class="kpi-value" id="kpi-out-sms">0</div>
+        <div class="kpi-sub" id="kpi-out-sms-sub">sent SMS</div>
+        <div class="kpi-bg-icon">📤</div>
+      </div>
+    </div>
+
+    <!-- ══════════════════════════════════════════════════════════════
+         PRIORITY 2 — VISUAL REPORTS
+    ══════════════════════════════════════════════════════════════ -->
+    <div class="section-sep">
+      <div class="sep-line"></div><div class="sep-text">VISUAL ANALYTICS</div><div class="sep-line"></div>
+    </div>
+
+    <!-- CHARTS ROW 1 -->
+    <div class="charts-row charts-row-3">
+      <div class="chart-card" onclick="drillChart('timeline')">
+        <div class="chart-header">
+          <div><span class="chart-title">Call Volume Over Time</span><div class="click-hint">▸ CLICK TO DRILL DOWN</div></div>
+          <span class="chart-badge">TREND</span>
+        </div>
+        <div class="chart-container" style="position:relative;height:280px;"><canvas id="chart-timeline"></canvas></div>
+      </div>
+      <div class="chart-card" onclick="drillChart('calltype')">
+        <div class="chart-header">
+          <div><span class="chart-title">Call Type Distribution</span><div class="click-hint">▸ CLICK TO DRILL DOWN</div></div>
+          <span class="chart-badge">BREAKDOWN</span>
+        </div>
+        <div class="chart-container" style="position:relative;height:280px;"><canvas id="chart-calltype"></canvas></div>
+      </div>
+      <div class="chart-card" onclick="drillChart('hourly')">
+        <div class="chart-header">
+          <div><span class="chart-title">Hourly Activity Pattern</span><div class="click-hint">▸ CLICK TO DRILL DOWN</div></div>
+          <span class="chart-badge">HEATMAP</span>
+        </div>
+        <div class="chart-container" style="position:relative;height:280px;"><canvas id="chart-hourly"></canvas></div>
+      </div>
+    </div>
+
+    <!-- CHARTS ROW 2 + GEO MAP (3 equal columns) -->
+    <div class="charts-row" style="grid-template-columns:1fr 1fr 1fr;">
+      <div class="chart-card" onclick="drillChart('topSubs')">
+        <div class="chart-header">
+          <div><span class="chart-title">Top 10 Subscribers by Call Volume</span><div class="click-hint">▸ CLICK TO DRILL DOWN</div></div>
+          <span class="chart-badge">RANKING</span>
+        </div>
+        <div class="chart-container" style="position:relative;height:280px;"><canvas id="chart-top-subscribers"></canvas></div>
+      </div>
+      <div class="chart-card" onclick="drillChart('durHist')">
+        <div class="chart-header">
+          <div><span class="chart-title">Duration Distribution</span><div class="click-hint">▸ CLICK TO DRILL DOWN</div></div>
+          <span class="chart-badge">HISTOGRAM</span>
+        </div>
+        <div class="chart-container" style="position:relative;height:280px;"><canvas id="chart-duration-dist"></canvas></div>
+      </div>
+      <div class="map-card" style="cursor:default;">
+        <div class="chart-header">
+          <div>
+            <span class="chart-title">Cell Tower Geo-Mapping</span>
+            <div class="click-hint">▸ CLICK MARKER FOR DETAILS</div>
+          </div>
+          <div style="display:flex;gap:8px;align-items:center;">
+            <span id="geo-point-count" style="font-family:'Share Tech Mono',monospace;font-size:10px;color:var(--text-dim);letter-spacing:1px;"></span>
+            <span class="chart-badge">GEO MAP</span>
+          </div>
+        </div>
+        <div id="geo-map-container">
+          <div id="geo-map"></div>
+          <div class="geo-map-legend" id="geo-legend">
+            <span><span class="geo-dot" style="background:#00f5ff;opacity:0.9;"></span>Low</span>
+            <span><span class="geo-dot" style="background:#00ff9d;opacity:0.9;"></span>Medium</span>
+            <span><span class="geo-dot" style="background:#ffd93d;opacity:0.9;"></span>High</span>
+            <span><span class="geo-dot" style="background:#ff6b35;opacity:0.9;"></span>Very High</span>
+          </div>
+        </div>
+        <div id="geo-no-data" class="geo-no-data" style="display:none;">
+          <span style="font-size:28px;opacity:0.3;">🗺</span>
+          <span>NO LAT/LON DATA</span>
+          <span style="font-size:10px;color:var(--text-dim);">Add LATITUDE &amp; LONGITUDE columns</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- DEEP ANALYSIS -->
+    <div class="section-sep">
+      <div class="sep-line"></div><div class="sep-text">DEEP INTELLIGENCE ANALYSIS</div><div class="sep-line"></div>
+    </div>
+    <div class="analysis-section">
+      <div class="analysis-header">
+        <div style="width:8px;height:8px;background:var(--accent-purple);box-shadow:0 0 8px rgba(179,71,255,0.8);"></div>
+        <span class="analysis-title">◈ BEHAVIORAL & NETWORK INTELLIGENCE</span>
+      </div>
+      <div class="analysis-grid">
+        <div class="analysis-card">
+          <div class="analysis-card-title">Top Active A-Parties</div>
+          <ul class="analysis-list" id="top-a-parties"></ul>
+        </div>
+        <div class="analysis-card">
+          <div class="analysis-card-title">Most Called B-Parties</div>
+          <ul class="analysis-list" id="top-b-parties"></ul>
+        </div>
+        <div class="analysis-card">
+          <div class="analysis-card-title">Top Cell Towers</div>
+          <ul class="analysis-list" id="top-cells"></ul>
+        </div>
+        <div class="analysis-card">
+          <div class="analysis-card-title">Device Activity (IMEI)</div>
+          <ul class="analysis-list" id="top-imei"></ul>
+        </div>
+        <div class="analysis-card">
+          <div class="analysis-card-title">Peak Call Hours</div>
+          <ul class="analysis-list" id="peak-hours"></ul>
+        </div>
+        <div class="analysis-card">
+          <div class="analysis-card-title">Longest Calls</div>
+          <ul class="analysis-list" id="longest-calls"></ul>
+        </div>
+        <div class="analysis-card">
+          <div class="analysis-card-title">Roaming Analysis</div>
+          <ul class="analysis-list" id="roaming-analysis"></ul>
+        </div>
+        <div class="analysis-card">
+          <div class="analysis-card-title">Call Forwarding Stats</div>
+          <ul class="analysis-list" id="fwd-stats"></ul>
+        </div>
+      </div>
+    </div>
+
+    <!-- RAW DATA EXPLORER -->
+    <div class="section-sep">
+      <div class="sep-line"></div><div class="sep-text">RAW DATA EXPLORER</div><div class="sep-line"></div>
+    </div>
+    <div class="table-section">
+      <div class="table-header-row">
+        <span class="analysis-title" style="font-size:12px;">◈ CDR RECORDS</span>
+        <div style="display:flex;gap:12px;align-items:center;">
+          <input class="search-box" type="text" placeholder="🔍 Search records..." id="table-search" oninput="renderTable()">
+          <span class="page-info" id="table-info"></span>
+        </div>
+      </div>
+      <div style="overflow-x:auto;">
+        <table class="data-table">
+          <thead><tr id="table-head"></tr></thead>
+          <tbody id="table-body"></tbody>
+        </table>
+      </div>
+      <div class="pagination" id="pagination"></div>
+    </div>
+
+  </section>
+</div>
+
+<!-- ── DRILL-DOWN MODAL ─────────────────────────────────────────────── -->
+<div class="modal-overlay" id="drill-modal" onclick="closeDrillIfOutside(event)">
+  <div class="modal-box">
+    <div class="modal-head">
+      <div style="display:flex;align-items:center;gap:8px;">
+        <div style="width:6px;height:6px;background:var(--accent-cyan);box-shadow:0 0 6px var(--accent-cyan);"></div>
+        <span class="modal-title" id="modal-title">DRILL-DOWN</span>
+        <span class="modal-meta" id="modal-meta"></span>
+      </div>
+      <button class="modal-close" onclick="closeDrill()">✕</button>
+    </div>
+    <div class="modal-search-bar">
+      <input class="modal-search" type="text" id="modal-search" placeholder="🔍 Filter records..." oninput="renderModalTable()">
+      <button class="modal-export" onclick="exportModalCSV()">↓ EXPORT CSV</button>
+      <span id="modal-count" style="font-family:'Share Tech Mono',monospace;font-size:11px;color:var(--text-dim);margin-left:auto;"></span>
+    </div>
+    <div class="modal-body">
+      <table class="modal-table">
+        <thead><tr id="modal-thead"></tr></thead>
+        <tbody id="modal-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- ── CALL TYPE MAPPER MODAL ───────────────────────────────────────────── -->
+<div class="ctmap-overlay" id="ctmap-modal">
+  <div class="ctmap-box">
+    <div class="ctmap-head">
+      <span class="ctmap-title">◈ MAP CALL TYPES</span>
+      <span class="ctmap-subtitle">
+        Assign each call type from your dataset to a category. Used for KPI direction counts and PDF report.
+      </span>
+    </div>
+    <div class="ctmap-body">
+      <table class="ctmap-table">
+        <thead>
+          <tr>
+            <th style="width:34%">RAW CALL TYPE (FROM FILE)</th>
+            <th style="width:14%;text-align:right">COUNT</th>
+            <th style="width:52%">MAP TO CATEGORY</th>
+          </tr>
+        </thead>
+        <tbody id="ctmap-tbody"></tbody>
+      </table>
+    </div>
+    <div class="ctmap-footer">
+      <button class="ctmap-btn-auto" onclick="autoMapCallTypes()">⚡ AUTO-DETECT</button>
+      <button class="ctmap-btn-primary" onclick="saveCallTypeMap()">✓ &nbsp;SAVE &amp; CONTINUE</button>
+      <span class="ctmap-hint" id="ctmap-hint">Map call types to enable direction KPIs</span>
+    </div>
+  </div>
+</div>
+
+<!-- ── CONTACT MODAL ─────────────────────────────────────────────────────── -->
+<div class="contact-overlay" id="contact-modal">
+  <div class="contact-box">
+
+    <div class="contact-head">
+      <div style="display:flex;align-items:center;gap:10px;">
+        <div style="width:7px;height:7px;background:var(--accent-orange);border-radius:50%;box-shadow:0 0 10px var(--accent-orange);animation:pulse-green 1.5s infinite;flex-shrink:0;"></div>
+        <span class="contact-title">◈ CONNECT BEFORE DOWNLOAD</span>
+      </div>
+      <span class="contact-subtitle">Fill in your details to receive the CDR Intelligence Report</span>
+    </div>
+
+    <div class="contact-body">
+      <div class="contact-row-2">
+        <div class="c-field">
+          <label>Full Name *</label>
+          <input type="text" id="c-name" placeholder="Your full name" autocomplete="name">
+        </div>
+        <div class="c-field">
+          <label>Organisation *</label>
+          <input type="text" id="c-org" placeholder="Agency / Company">
+        </div>
+      </div>
+      <div class="contact-row-2">
+        <div class="c-field">
+          <label>Email Address *</label>
+          <input type="email" id="c-email" placeholder="you@example.com" autocomplete="email">
+        </div>
+        <div class="c-field">
+          <label>Phone / WhatsApp *</label>
+          <input type="tel" id="c-phone" placeholder="+91 XXXXX XXXXX" autocomplete="tel">
+        </div>
+      </div>
+      <div class="contact-row-1">
+        <div class="c-field">
+          <label>Purpose of Report</label>
+          <input type="text" id="c-purpose" placeholder="e.g. Investigation / Research / Compliance / Audit">
+        </div>
+      </div>
+    </div>
+
+    <div class="contact-divider"></div>
+
+    <div class="contact-footer">
+      <div class="contact-status" id="contact-status"></div>
+      <button class="contact-submit-btn" id="c-submit-btn" onclick="submitContact()">
+        ↓ &nbsp;&nbsp;SAVE &amp; DOWNLOAD REPORT
+      </button>
+      <div class="contact-privacy">◈ Your details are stored securely for analytics collaboration only</div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+// ─── STATE ───────────────────────────────────────────────────────────────────
+let rawData = [], filteredData = [], sortedData = [];
+let charts = {};
+let currentPage = 1;
+const PAGE_SIZE = 20;
+let allDates = [], minDateIdx = 0, maxDateIdx = 100;
+let currentTopN = 10;
+
+// Column header mapping
+const COL_MAP = {
+  aParty:   ['A PARTY','A_PARTY','APARTY','CALLER','FROM',
+             'TARGET NO','TARGET_NO','TARGETNO','TARGET NUMBER','TARGET'],
+  bParty:   ['B PARTY','B_PARTY','BPARTY','CALLEE','TO',
+             'B PARTY NO','B_PARTY_NO','BPARTYNO','B PARTY NUMBER','CALLED NO','CALLED NUMBER'],
+  date:     ['DATE','CALL DATE'],
+  time:     ['TIME','CALL TIME'],
+  duration: ['DURATION','CALL DURATION','DUR',
+             'DUR(S)','DURS','DURATION(S)','CALL DUR','DURATION S'],
+  callType: ['CALL TYPE','CALLTYPE','TYPE'],
+  cellIdA:  ['FIRST CELL ID A','CELL ID A','CELL_ID_A','CELLID','FIRST CELL ID',
+             'FIRST CGI','CGI','CGI A','FIRST CGI A','CELL GLOBAL IDENTITY'],
+  imei:     ['IMEI A','IMEI','DEVICE ID'],
+  imsi:     ['IMSI A','IMSI'],
+  address:  ['FIRST CELL ID A ADDRESS','ADDRESS','CELL ADDRESS'],
+  roaming:  ['ROAMING A','ROAMING','ROAM',
+             'ROAM NW','ROAMNW','ROAMING NW','ROAMING NETWORK','ROAM NETWORK'],
+  callFwd:  ['CALL FORWARDING','CALL FWD','FORWARDING'],
+  lat:      ['LATITUDE','LAT'],
+  lon:      ['LONGITUDE','LON','LNG']
+};
+
+// ─── CALL TYPE MAP ───────────────────────────────────────────────────────────
+// Populated by the user via the mapper modal after each file load.
+// Keys = raw call type strings from file (uppercased)
+// Values = 'IN_CALL' | 'OUT_CALL' | 'IN_SMS' | 'OUT_SMS' | 'UNKNOWN'
+let CALL_TYPE_MAP = {};
+
+// Auto-detection rules — ORDER MATTERS: SMS rules checked BEFORE voice rules
+// so "SMS MT" matches IN_SMS before the bare "MT" keyword matches IN_CALL.
+const CALL_TYPE_AUTO_RULES = {
+  IN_SMS:   ['SMS MT','SMS-MT','SMMT','SMT','SMS INCOMING','SMS IN','SMS RECEIVED',
+             'TEXT MT','MSG MT','MESSAGE MT','INBOUND SMS','INCOMING SMS',
+             'MMS MT','MMS IN','MMS INCOMING'],
+  OUT_SMS:  ['SMS MO','SMS-MO','SMMO','SMO','SMS OUTGOING','SMS OUT','SMS SENT',
+             'TEXT MO','MSG MO','MESSAGE MO','OUTBOUND SMS','OUTGOING SMS',
+             'MMS MO','MMS OUT','MMS OUTGOING'],
+  IN_CALL:  ['VOICE MT','CALL MT','VOICE IN','CALL IN','MT CALL','INCOMING CALL',
+             'INBOUND CALL','RECEIVED CALL','MTC','TERMINATING',
+             'VOICE TERMINATING','CALL TERMINATING'],
+  OUT_CALL: ['VOICE MO','CALL MO','VOICE OUT','CALL OUT','MO CALL','OUTGOING CALL',
+             'OUTBOUND CALL','DIALLED CALL','DIALED CALL','MOC','ORIGINATING',
+             'VOICE ORIGINATING','CALL ORIGINATING']
+};
+
+// Resolve a raw call type value to its mapped category
+function resolveCallType(rawVal) {
+  if (!rawVal) return 'UNKNOWN';
+  const up = rawVal.toString().toUpperCase().trim();
+  return CALL_TYPE_MAP[up] || 'UNKNOWN';
+}
+
+// Check if a category is SMS
+function isSMS(cat)     { return cat === 'IN_SMS'   || cat === 'OUT_SMS';  }
+// Check if a category is incoming
+function isIncoming(cat){ return cat === 'IN_CALL'  || cat === 'IN_SMS';   }
+// Check if a category is outgoing
+function isOutgoing(cat){ return cat === 'OUT_CALL' || cat === 'OUT_SMS';  }
+
+// ─── CALL TYPE MAPPER MODAL ───────────────────────────────────────────────────
+function showCallTypeMapper() {
+  // Collect unique call types from the loaded data with their counts
+  const typeCounts = {};
+  rawData.forEach(r => {
+    const ct = getVal(r, 'callType');
+    if (ct) typeCounts[ct] = (typeCounts[ct] || 0) + 1;
+  });
+
+  const types = Object.entries(typeCounts).sort((a, b) => b[1] - a[1]);
+
+  // If no call type column found at all, skip mapper and go straight to dashboard
+  if (!types.length) {
+    _finishLoading();
+    return;
+  }
+
+  // Auto-detect mappings first so dropdowns start pre-filled
+  _autoDetectMappings(types.map(([t]) => t));
+
+  // Build table rows
+  const tbody = document.getElementById('ctmap-tbody');
+  tbody.innerHTML = '';
+  types.forEach(([rawType, count]) => {
+    const up  = rawType.toUpperCase().trim();
+    const cur = CALL_TYPE_MAP[up] || 'UNKNOWN';
+    const tr  = document.createElement('tr');
+    tr.innerHTML = `
+      <td class="ctmap-raw">${rawType}</td>
+      <td class="ctmap-count">${count.toLocaleString()}</td>
+      <td>
+        <select class="ctmap-select mapped-${cur.toLowerCase().replace('_','-')}"
+                data-raw="${up}"
+                onchange="onCtMapChange(this)">
+          <option value="IN_CALL"  ${cur==='IN_CALL'  ?'selected':''}>📲  Incoming Call</option>
+          <option value="OUT_CALL" ${cur==='OUT_CALL' ?'selected':''}>📞  Outgoing Call</option>
+          <option value="IN_SMS"   ${cur==='IN_SMS'   ?'selected':''}>📩  Incoming SMS / Message</option>
+          <option value="OUT_SMS"  ${cur==='OUT_SMS'  ?'selected':''}>📤  Outgoing SMS / Message</option>
+          <option value="UNKNOWN"  ${cur==='UNKNOWN'  ?'selected':''}>❓  Unknown / Other</option>
+        </select>
+      </td>`;
+    tbody.appendChild(tr);
+  });
+
+  _updateCtMapHint();
+  document.getElementById('ctmap-modal').classList.add('open');
+  document.body.style.overflow = 'hidden';
+}
+
+function onCtMapChange(sel) {
+  const raw = sel.getAttribute('data-raw');
+  const val = sel.value;
+  CALL_TYPE_MAP[raw] = val;
+  // Update select colour class
+  sel.className = 'ctmap-select mapped-' + val.toLowerCase().replace('_', '-');
+  _updateCtMapHint();
+}
+
+function _updateCtMapHint() {
+  const rows   = document.querySelectorAll('#ctmap-tbody select');
+  const mapped = [...rows].filter(s => s.value !== 'UNKNOWN').length;
+  const hint   = document.getElementById('ctmap-hint');
+  if (hint) hint.textContent = mapped + ' of ' + rows.length + ' types mapped';
+}
+
+function autoMapCallTypes() {
+  const rows = document.querySelectorAll('#ctmap-tbody select');
+  rows.forEach(sel => {
+    const raw = sel.getAttribute('data-raw');
+    const cat = _autoDetectOne(raw);
+    CALL_TYPE_MAP[raw] = cat;
+    sel.value = cat;
+    sel.className = 'ctmap-select mapped-' + cat.toLowerCase().replace('_', '-');
+  });
+  _updateCtMapHint();
+}
+
+function _autoDetectMappings(types) {
+  types.forEach(t => {
+    const up = t.toUpperCase().trim();
+    CALL_TYPE_MAP[up] = _autoDetectOne(up);
+  });
+}
+
+function _autoDetectOne(up) {
+  // ── STEP 1: Check full-string matches first (exact type values) ─────────
+  const exactMap = {
+    'MT': 'IN_CALL', 'MO': 'OUT_CALL',
+    'SMS': 'OUT_SMS', 'SMS MT': 'IN_SMS', 'SMS MO': 'OUT_SMS',
+    'SMMT': 'IN_SMS', 'SMMO': 'OUT_SMS',
+    'SMT': 'IN_SMS',  'SMO': 'OUT_SMS',
+    'MMS MT': 'IN_SMS', 'MMS MO': 'OUT_SMS',
+    'VOICE MT': 'IN_CALL', 'VOICE MO': 'OUT_CALL',
+    'CALL MT': 'IN_CALL', 'CALL MO': 'OUT_CALL',
+    'MTC': 'IN_CALL', 'MOC': 'OUT_CALL',
+  };
+  if (exactMap[up]) return exactMap[up];
+
+  // ── STEP 2: SMS detection — must happen BEFORE bare MT/MO check ─────────
+  // If the value contains 'SMS' or 'MMS' or 'TEXT' or 'MSG', it's a message type
+  const isSMSType = up.includes('SMS') || up.includes('MMS') ||
+                    up.includes('TEXT') || (up.includes('MSG') && !up.includes('MSGR'));
+
+  if (isSMSType) {
+    // Within SMS types, determine direction
+    const inSMSKeys  = ['MT', 'IN', 'INCOMING', 'INBOUND', 'RECEIVED'];
+    const outSMSKeys = ['MO', 'OUT', 'OUTGOING', 'OUTBOUND', 'SENT'];
+    for (const kw of inSMSKeys) {
+      if (up === kw || up.includes(' ' + kw) || up.includes(kw + ' ') ||
+          up.startsWith(kw) || up.endsWith(kw)) {
+        return 'IN_SMS';
+      }
+    }
+    for (const kw of outSMSKeys) {
+      if (up === kw || up.includes(' ' + kw) || up.includes(kw + ' ') ||
+          up.startsWith(kw) || up.endsWith(kw)) {
+        return 'OUT_SMS';
+      }
+    }
+    return 'OUT_SMS'; // Default SMS to outgoing if direction not found
+  }
+
+  // ── STEP 3: Voice call — check compound keywords ─────────────────────────
+  const inCallKeys  = ['VOICE MT','CALL MT','VOICE IN','CALL IN','MT CALL',
+                       'INCOMING','INBOUND','RECEIVED','TERMINATING','MTC','TERM'];
+  const outCallKeys = ['VOICE MO','CALL MO','VOICE OUT','CALL OUT','MO CALL',
+                       'OUTGOING','OUTBOUND','DIALLED','DIALED','ORIGINATING','MOC','ORIG'];
+
+  for (const kw of inCallKeys)  { if (up.includes(kw)) return 'IN_CALL';  }
+  for (const kw of outCallKeys) { if (up.includes(kw)) return 'OUT_CALL'; }
+
+  // ── STEP 4: Bare MO / MT as absolute last resort ─────────────────────────
+  if (up === 'MT' || up.endsWith(' MT') || up.startsWith('MT ')) return 'IN_CALL';
+  if (up === 'MO' || up.endsWith(' MO') || up.startsWith('MO ')) return 'OUT_CALL';
+
+  return 'UNKNOWN';
+}
+
+function saveCallTypeMap() {
+  document.getElementById('ctmap-modal').classList.remove('open');
+  document.body.style.overflow = '';
+  _finishLoading();
+}
+
+function _finishLoading() {
+  showLoading(false);
+  initFilters();
+  applyFilters();
+  document.getElementById('upload-section').style.display  = 'none';
+  document.getElementById('dashboard-section').style.display = 'block';
+}
+
+// ─── FILE HANDLING ────────────────────────────────────────────────────────────
+function handleDrop(e) {
+  e.preventDefault();
+  document.getElementById('drop-zone').classList.remove('drag-over');
+  const file = e.dataTransfer.files[0];
+  if (file) processFile(file);
+}
+
+function handleFile(e) {
+  const file = e.target.files[0];
+  if (file) processFile(file);
+}
+
+function processFile(file) {
+  showLoading(true);
+  const ext = file.name.split('.').pop().toLowerCase();
+
+  if (ext === 'csv') {
+    // CSV always works — inline parser handles file:// with no internet
+    PapaParse.parse(file, {
+      header: true,
+      skipEmptyLines: true,
+      complete: function(r) { loadData(r.data); showLoading(false); }
+    });
+
+  } else if (ext === 'xlsx' || ext === 'xls') {
+    const reader = new FileReader();
+    reader.onload = function(e) {
+      try {
+        const wb   = XLSX.read(e.target.result, { type: 'array' });
+        const ws   = wb.Sheets[wb.SheetNames[0]];
+        const data = XLSX.utils.sheet_to_json(ws, { defval: '' });
+        if (!data.length) {
+          showLoading(false);
+          alert(
+            'Could not read the Excel file.\n\n' +
+            'If you are opening this dashboard directly from your Downloads folder, ' +
+            'please re-save your data as CSV first:\n' +
+            'Excel → File → Save As → CSV UTF-8 (.csv)\n\n' +
+            'CSV files work fully offline with this dashboard.'
+          );
+          return;
+        }
+        loadData(data);
+        showLoading(false);
+      } catch(err) {
+        showLoading(false);
+        alert(
+          'Excel parse error: ' + err.message + '\n\n' +
+          'Please re-save as CSV UTF-8 and try again.'
+        );
+      }
+    };
+    reader.readAsArrayBuffer(file);
+
+  } else {
+    showLoading(false);
+    alert('Unsupported file type: .' + ext + '\nPlease upload a CSV, XLSX, or XLS file.');
+  }
+}
+
+function showLoading(b) {
+  document.getElementById('loading').style.display = b ? 'flex' : 'none';
+}
+
+// ─── COLUMN RESOLVER ──────────────────────────────────────────────────────────
+function resolveCol(headers, candidates) {
+  const uh = headers.map(h => h.toUpperCase().trim());
+  for (const c of candidates) {
+    const idx = uh.indexOf(c.toUpperCase());
+    if (idx >= 0) return headers[idx];
+  }
+  return null;
+}
+
+let colKeys = {};
+
+function loadData(data) {
+  if (!data.length) return;
+  rawData = data;
+  const headers = Object.keys(data[0]);
+  for (const [k, v] of Object.entries(COL_MAP)) {
+    colKeys[k] = resolveCol(headers, v);
+  }
+
+  // Parse dates for timeline
+  allDates = [...new Set(rawData.map(r => getVal(r,'date')).filter(Boolean))].sort();
+
+  // Reset call type map for fresh file
+  CALL_TYPE_MAP = {};
+
+  // Show call type mapper modal before showing dashboard
+  showCallTypeMapper();
+}
+
+function getVal(row, col) {
+  const key = colKeys[col];
+  return key ? (row[key] || '') : '';
+}
+
+// ─── FILTERS ──────────────────────────────────────────────────────────────────
+function initFilters() {
+  // Call type dropdown
+  const types = [...new Set(rawData.map(r => getVal(r,'callType')).filter(Boolean))];
+  const sel = document.getElementById('f-call-type');
+  sel.innerHTML = '<option value="">ALL TYPES</option>';
+  types.forEach(t => sel.innerHTML += `<option value="${t}">${t}</option>`);
+
+  // Cell ID
+  const cells = [...new Set(rawData.map(r => getVal(r,'cellIdA')).filter(Boolean))].slice(0,50);
+  const cs = document.getElementById('f-cellid');
+  cs.innerHTML = '<option value="">ALL CELLS</option>';
+  cells.forEach(c => cs.innerHTML += `<option value="${c}">${c}</option>`);
+
+  // Timeline
+  document.getElementById('timeline-start').value = 0;
+  document.getElementById('timeline-end').value = 100;
+  updateTimeline();
+}
+
+function applyFilters() {
+  const callType = document.getElementById('f-call-type').value;
+  const roaming = document.getElementById('f-roaming').value;
+  const aParty = document.getElementById('f-aparty').value.trim().toLowerCase();
+  const bParty = document.getElementById('f-bparty').value.trim().toLowerCase();
+  const cellId = document.getElementById('f-cellid').value;
+  const imei = document.getElementById('f-imei').value.trim().toLowerCase();
+
+  const s = parseInt(document.getElementById('timeline-start').value);
+  const e = parseInt(document.getElementById('timeline-end').value);
+  const dateRange = getDateRange(s, e);
+
+  filteredData = rawData.filter(r => {
+    if (callType && getVal(r,'callType') !== callType) return false;
+    if (roaming === 'yes' && !isRoaming(getVal(r,'roaming'))) return false;
+    if (roaming === 'no' && isRoaming(getVal(r,'roaming'))) return false;
+    if (aParty && !getVal(r,'aParty').toLowerCase().includes(aParty)) return false;
+    if (bParty && !getVal(r,'bParty').toLowerCase().includes(bParty)) return false;
+    if (cellId && getVal(r,'cellIdA') !== cellId) return false;
+    if (imei && !getVal(r,'imei').toLowerCase().includes(imei)) return false;
+    if (dateRange && allDates.length > 1) {
+      const d = getVal(r,'date');
+      if (d && (d < dateRange[0] || d > dateRange[1])) return false;
+    }
+    return true;
+  });
+
+  sortedData = [...filteredData];
+  currentPage = 1;
+  updateAll();
+}
+
+function isRoaming(v) {
+  return v && ['yes','1','true','y'].includes(v.toString().toLowerCase());
+}
+
+function resetFilters() {
+  document.getElementById('f-call-type').value = '';
+  document.getElementById('f-roaming').value = '';
+  document.getElementById('f-aparty').value = '';
+  document.getElementById('f-bparty').value = '';
+  document.getElementById('f-cellid').value = '';
+  document.getElementById('f-imei').value = '';
+  document.getElementById('timeline-start').value = 0;
+  document.getElementById('timeline-end').value = 100;
+  updateTimeline();
+  applyFilters();
+}
+
+// ─── TIMELINE ─────────────────────────────────────────────────────────────────
+function getDateRange(s, e) {
+  if (!allDates.length) return null;
+  const si = Math.floor(s / 100 * (allDates.length - 1));
+  const ei = Math.floor(e / 100 * (allDates.length - 1));
+  return [allDates[si], allDates[ei]];
+}
+
+function updateTimeline() {
+  let s = parseInt(document.getElementById('timeline-start').value);
+  let e = parseInt(document.getElementById('timeline-end').value);
+  if (s > e) { [s, e] = [e, s]; }
+  const fill = document.getElementById('range-fill');
+  fill.style.left = s + '%';
+  fill.style.width = (e - s) + '%';
+  const range = getDateRange(s, e);
+  if (range) {
+    document.getElementById('timeline-display').textContent = `${range[0]}  ──  ${range[1]}`;
+  } else {
+    document.getElementById('timeline-display').textContent = 'ALL DATES';
+  }
+  applyFilters();
+}
+
+// ─── MAIN UPDATE ─────────────────────────────────────────────────────────────
+function updateAll() {
+  document.getElementById('record-count').textContent = filteredData.length.toLocaleString() + ' RECORDS';
+  updateKPIs();
+  updateReportTables();
+  updateCharts();
+  updateGeoMap();
+  updateAnalysis();
+  renderTable();
+}
+
+// ─── KPIs ─────────────────────────────────────────────────────────────────────
+function updateKPIs() {
+  const n = filteredData.length;
+  document.getElementById('kpi-total').textContent = n.toLocaleString();
+  document.getElementById('kpi-total-sub').textContent = 'filtered records';
+
+  // Avg duration
+  const durs = filteredData.map(r => parseDuration(getVal(r,'duration'))).filter(d => d > 0);
+  const avg = durs.length ? Math.round(durs.reduce((a,b) => a+b, 0) / durs.length) : 0;
+  document.getElementById('kpi-avg-dur').textContent = formatDur(avg);
+  document.getElementById('kpi-dur-sub').textContent = `max: ${formatDur(Math.max(0,...durs))}`;
+
+  // Unique subscribers
+  const uniq = new Set(filteredData.map(r => getVal(r,'aParty')).filter(Boolean));
+  document.getElementById('kpi-subscribers').textContent = uniq.size.toLocaleString();
+  document.getElementById('kpi-subs-sub').textContent = `${new Set(filteredData.map(r=>getVal(r,'bParty')).filter(Boolean)).size} B-parties`;
+
+  // Roaming
+  const roam = filteredData.filter(r => isRoaming(getVal(r,'roaming'))).length;
+  document.getElementById('kpi-roaming').textContent = n ? Math.round(roam/n*100) + '%' : '0%';
+  document.getElementById('kpi-roam-sub').textContent = roam.toLocaleString() + ' roaming calls';
+
+  // Cell IDs
+  const cells = new Set(filteredData.map(r => getVal(r,'cellIdA')).filter(Boolean));
+  document.getElementById('kpi-cells').textContent = cells.size.toLocaleString();
+  document.getElementById('kpi-cells-sub').textContent = 'unique towers';
+
+  // ── Row 2: Incoming / Outgoing Calls & Messages ───────────────────────────
+  let inCalls = 0, outCalls = 0, inSMS = 0, outSMS = 0;
+  filteredData.forEach(r => {
+    const raw = getVal(r,'callType') || '';
+    const cat = resolveCallType(raw);
+    if      (cat === 'IN_CALL')  inCalls++;
+    else if (cat === 'OUT_CALL') outCalls++;
+    else if (cat === 'IN_SMS')   inSMS++;
+    else if (cat === 'OUT_SMS')  outSMS++;
+    else {
+      // Fallback heuristic if not mapped yet
+      const ct = raw.toUpperCase();
+      const isMO = ct.includes('MO') || ct.includes('OUT') || ct.includes('OUTGOING');
+      const isMT = ct.includes('MT') || ct.includes('IN')  || ct.includes('INCOMING');
+      const isSMSt = ct.includes('SMS');
+      if (isSMSt) { if (isMT) inSMS++; else outSMS++; }
+      else        { if (isMT) inCalls++; else outCalls++; }
+    }
+  });
+
+  document.getElementById('kpi-in-calls').textContent  = inCalls.toLocaleString();
+  document.getElementById('kpi-in-calls-sub').textContent =
+    n ? Math.round(inCalls/n*100) + '% of total' : 'received calls';
+
+  document.getElementById('kpi-out-calls').textContent = outCalls.toLocaleString();
+  document.getElementById('kpi-out-calls-sub').textContent =
+    n ? Math.round(outCalls/n*100) + '% of total' : 'dialled calls';
+
+  document.getElementById('kpi-in-sms').textContent    = inSMS.toLocaleString();
+  document.getElementById('kpi-in-sms-sub').textContent =
+    n ? Math.round(inSMS/n*100)   + '% of total' : 'received SMS';
+
+  document.getElementById('kpi-out-sms').textContent   = outSMS.toLocaleString();
+  document.getElementById('kpi-out-sms-sub').textContent =
+    n ? Math.round(outSMS/n*100)  + '% of total' : 'sent SMS';
+}
+
+function parseDuration(v) {
+  if (!v) return 0;
+  v = v.toString().trim();
+  const parts = v.split(':');
+  if (parts.length === 3) return parseInt(parts[0])*3600 + parseInt(parts[1])*60 + parseInt(parts[2]);
+  if (parts.length === 2) return parseInt(parts[0])*60 + parseInt(parts[1]);
+  return parseInt(v) || 0;
+}
+
+function formatDur(s) {
+  if (s >= 3600) return Math.round(s/3600) + 'h';
+  if (s >= 60) return Math.round(s/60) + 'm';
+  return s + 's';
+}
+
+// ─── CHARTS ───────────────────────────────────────────────────────────────────
+const C = {
+  cyan: '#00f5ff', green: '#00ff9d', orange: '#ff6b35',
+  purple: '#b347ff', yellow: '#ffd93d',
+  grid: 'rgba(14,58,84,0.5)', text: '#7ab3c8'
+};
+
+function chartDefaults() {
+  if (typeof Chart === 'undefined') return {};
+  return {
+    responsive: true,
+    plugins: {
+      legend: { labels: { color: C.text, font: { family: 'Share Tech Mono', size: 11 }, boxWidth: 12 } },
+      tooltip: {
+        backgroundColor: '#0a1e2e',
+        borderColor: '#1a6a8a',
+        borderWidth: 1,
+        titleColor: C.cyan,
+        bodyColor: C.text,
+        titleFont: { family: 'Share Tech Mono' },
+        bodyFont: { family: 'Share Tech Mono' }
+      }
+    },
+    scales: {
+      x: { ticks: { color: C.text, font: { family: 'Share Tech Mono', size: 10 } }, grid: { color: C.grid } },
+      y: { ticks: { color: C.text, font: { family: 'Share Tech Mono', size: 10 } }, grid: { color: C.grid } }
+    }
+  };
+}
+
+function destroyChart(id) {
+  if (charts[id]) { try { charts[id].destroy(); } catch(e){} delete charts[id]; }
+}
+
+function updateCharts() {
+  updateTimelineChart();
+  updateCallTypeChart();
+  updateHourlyChart();
+  updateTopSubscribersChart();
+  updateDurationHistChart();
+}
+
+function updateTimelineChart() {
+  destroyChart('timeline');
+  const byDate = {};
+  filteredData.forEach(r => {
+    const d = getVal(r,'date') || 'Unknown';
+    byDate[d] = (byDate[d] || 0) + 1;
+  });
+  const labels = Object.keys(byDate).sort().slice(-30);
+  const vals = labels.map(l => byDate[l]);
+  const ctx = document.getElementById('chart-timeline').getContext('2d');
+  if (typeof Chart === 'undefined') return;
+  charts.timeline = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [{
+        label: 'Calls',
+        data: vals,
+        borderColor: C.cyan,
+        backgroundColor: 'rgba(0,245,255,0.06)',
+        fill: true,
+        tension: 0.4,
+        pointRadius: 3,
+        pointBackgroundColor: C.cyan
+      }]
+    },
+    options: { ...chartDefaults(), maintainAspectRatio: false, plugins: { ...chartDefaults().plugins, legend: { display: false } } }
+  });
+}
+
+function updateCallTypeChart() {
+  destroyChart('calltype');
+  const by = {};
+  filteredData.forEach(r => { const t = getVal(r,'callType') || 'Unknown'; by[t] = (by[t]||0)+1; });
+  const labels = Object.keys(by);
+  const vals = labels.map(l => by[l]);
+  const colors = [C.cyan, C.green, C.orange, C.purple, C.yellow, '#ff4d6d','#4dffff'];
+  const ctx = document.getElementById('chart-calltype').getContext('2d');
+  charts.calltype = new Chart(ctx, {
+    type: 'doughnut',
+    data: {
+      labels,
+      datasets: [{ data: vals, backgroundColor: colors.slice(0,labels.length), borderWidth: 2, borderColor: '#0a1e2e', hoverOffset: 8 }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      layout: { padding: { top: 4, bottom: 4 } },
+      plugins: {
+        legend: {
+          position: 'bottom',
+          labels: {
+            color: C.text,
+            font: { family:'Share Tech Mono', size: 9 },
+            padding: 8,
+            boxWidth: 10,
+            boxHeight: 10
+          }
+        },
+        tooltip: chartDefaults().plugins.tooltip
+      }
+    }
+  });
+}
+
+function updateHourlyChart() {
+  destroyChart('hourly');
+  const hours = Array(24).fill(0);
+  filteredData.forEach(r => {
+    const t = getVal(r,'time');
+    if (t) {
+      const h = parseInt(t.split(':')[0]);
+      if (!isNaN(h) && h >= 0 && h < 24) hours[h]++;
+    }
+  });
+  const ctx = document.getElementById('chart-hourly').getContext('2d');
+  const bgColors = hours.map(v => {
+    const max = Math.max(...hours);
+    const ratio = max > 0 ? v/max : 0;
+    return `rgba(0,245,255,${0.1 + ratio*0.6})`;
+  });
+  charts.hourly = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels: Array.from({length:24}, (_,i) => i.toString().padStart(2,'0')+'h'),
+      datasets: [{ label: 'Calls', data: hours, backgroundColor: bgColors, borderColor: C.cyan, borderWidth: 1, borderRadius: 2 }]
+    },
+    options: { ...chartDefaults(), maintainAspectRatio: false, plugins: { ...chartDefaults().plugins, legend: { display: false } } }
+  });
+}
+
+function updateTopSubscribersChart() {
+  destroyChart('topSubs');
+  const by = {};
+  filteredData.forEach(r => { const a = getVal(r,'aParty'); if(a) by[a] = (by[a]||0)+1; });
+  const sorted = Object.entries(by).sort((a,b)=>b[1]-a[1]).slice(0,10);
+  const labels = sorted.map(([k]) => k.slice(-8));
+  const vals = sorted.map(([,v]) => v);
+  const ctx = document.getElementById('chart-top-subscribers').getContext('2d');
+  charts.topSubs = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [{
+        label: 'Calls',
+        data: vals,
+        backgroundColor: labels.map((_,i) => i===0 ? C.cyan : `rgba(0,245,255,${0.6-i*0.05})`),
+        borderColor: C.cyan,
+        borderWidth: 1,
+        borderRadius: 3
+      }]
+    },
+    options: {
+      indexAxis: 'y',
+      ...chartDefaults(),
+      plugins: { ...chartDefaults().plugins, legend: { display: false } }
+    }
+  });
+}
+
+function updateDurationHistChart() {
+  destroyChart('durHist');
+  const durs = filteredData.map(r => parseDuration(getVal(r,'duration'))).filter(d => d >= 0);
+  const bins = [0,30,60,120,300,600,1800,3600,Infinity];
+  const labels = ['0-30s','30s-1m','1-2m','2-5m','5-10m','10-30m','30m-1h','1h+'];
+  const counts = Array(8).fill(0);
+  durs.forEach(d => {
+    for(let i=0;i<bins.length-1;i++) { if(d>=bins[i] && d<bins[i+1]) { counts[i]++; break; } }
+  });
+  const ctx = document.getElementById('chart-duration-dist').getContext('2d');
+  const grad = ctx.createLinearGradient(0,0,0,200);
+  grad.addColorStop(0,'rgba(0,255,157,0.8)');
+  grad.addColorStop(1,'rgba(0,255,157,0.1)');
+  charts.durHist = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [{ label: 'Calls', data: counts, backgroundColor: grad, borderColor: C.green, borderWidth: 1, borderRadius: 3 }]
+    },
+    options: { ...chartDefaults(), maintainAspectRatio: false, plugins: { ...chartDefaults().plugins, legend: { display: false } } }
+  });
+}
+
+// ─── DEEP ANALYSIS ────────────────────────────────────────────────────────────
+function updateAnalysis() {
+  // Top A parties
+  const aMap = freq(filteredData.map(r => getVal(r,'aParty')));
+  fillList('top-a-parties', top5(aMap), 'cyan', v => v + ' calls', (k) => openDrill(
+    `A PARTY: ${k}`, filteredData.filter(r => getVal(r,'aParty') === k)
+  ));
+
+  // Top B parties
+  const bMap = freq(filteredData.map(r => getVal(r,'bParty')));
+  fillList('top-b-parties', top5(bMap), 'green', v => v + ' calls', (k) => openDrill(
+    `B PARTY: ${k}`, filteredData.filter(r => getVal(r,'bParty') === k)
+  ));
+
+  // Top cells
+  const cellMap = freq(filteredData.map(r => getVal(r,'cellIdA')));
+  fillList('top-cells', top5(cellMap), 'orange', v => v + ' hits', (k) => openDrill(
+    `CELL ID: ${k}`, filteredData.filter(r => getVal(r,'cellIdA') === k)
+  ));
+
+  // IMEI
+  const imeiMap = freq(filteredData.map(r => getVal(r,'imei')));
+  fillList('top-imei', top5(imeiMap), 'yellow', v => v + ' calls', (k) => openDrill(
+    `IMEI: ${k}`, filteredData.filter(r => getVal(r,'imei') === k)
+  ));
+
+  // Peak hours
+  const hourMap = {};
+  filteredData.forEach(r => {
+    const t = getVal(r,'time');
+    if(t) { const h = parseInt(t.split(':')[0]); if(!isNaN(h)) hourMap[h+'h'] = (hourMap[h+'h']||0)+1; }
+  });
+  fillList('peak-hours', top5(hourMap), 'cyan', v => v + ' calls', (k) => {
+    const hNum = parseInt(k);
+    openDrill(`PEAK HOUR: ${k}`, filteredData.filter(r => {
+      const t = getVal(r,'time'); if(!t) return false;
+      return parseInt(t.split(':')[0]) === hNum;
+    }));
+  });
+
+  // Longest calls — show FULL numbers
+  const longest = filteredData
+    .map(r => ({ a: getVal(r,'aParty'), b: getVal(r,'bParty'), d: parseDuration(getVal(r,'duration')), raw: r }))
+    .sort((a,b) => b.d - a.d).slice(0,5);
+  const ll = document.getElementById('longest-calls');
+  ll.innerHTML = '';
+  longest.forEach(c => {
+    if (c.d > 0) {
+      const li = document.createElement('li');
+      li.title = `${c.a} → ${c.b}`;
+      li.innerHTML = `
+        <span class="row-label" style="font-size:11px;max-width:160px;" title="${c.a} → ${c.b}">
+          ${c.a || '?'} → ${c.b || '?'}
+        </span>
+        <span class="val cyan">${formatDur(c.d)}</span>`;
+      li.onclick = () => openDrill(
+        `LONGEST CALL: ${(c.a||'?')} → ${(c.b||'?')}`,
+        filteredData.filter(r => getVal(r,'aParty') === c.a && getVal(r,'bParty') === c.b)
+      );
+      ll.appendChild(li);
+    }
+  });
+
+  // Roaming
+  const roamTypes = {};
+  filteredData.forEach(r => {
+    const rv = (getVal(r,'roaming')||'Local').toString();
+    const key = isRoaming(rv) ? 'Roaming' : 'Local';
+    roamTypes[key] = (roamTypes[key]||0)+1;
+  });
+  fillList('roaming-analysis', Object.entries(roamTypes).sort((a,b)=>b[1]-a[1]), 'orange', v=>v+' calls', (k) => openDrill(
+    `ROAMING: ${k}`, filteredData.filter(r => (isRoaming(getVal(r,'roaming')) ? 'Roaming' : 'Local') === k)
+  ));
+
+  // Call forwarding
+  const fwdMap = freq(filteredData.map(r => {
+    const v = getVal(r,'callFwd');
+    return v && ['yes','1','true','y'].includes(v.toString().toLowerCase()) ? 'Forwarded' : 'Direct';
+  }));
+  fillList('fwd-stats', Object.entries(fwdMap).sort((a,b)=>b[1]-a[1]), 'purple', v => v + ' calls', (k) => openDrill(
+    `CALL FORWARDING: ${k}`, filteredData.filter(r => {
+      const v = getVal(r,'callFwd');
+      const fwd = v && ['yes','1','true','y'].includes(v.toString().toLowerCase()) ? 'Forwarded' : 'Direct';
+      return fwd === k;
+    })
+  ));
+}
+
+function freq(arr) {
+  const m = {};
+  arr.filter(Boolean).forEach(v => m[v] = (m[v]||0)+1);
+  return m;
+}
+
+function top5(m) {
+  return Object.entries(m).sort((a,b)=>b[1]-a[1]).slice(0,5);
+}
+
+function fillList(id, entries, color, fmt, drillFn) {
+  const el = document.getElementById(id);
+  if (!entries.length) { el.innerHTML = '<li style="color:var(--text-dim);font-size:11px">No data</li>'; return; }
+  el.innerHTML = '';
+  entries.forEach(([k, v]) => {
+    const li = document.createElement('li');
+    li.title = `Click to drill: ${k}`;
+    li.innerHTML = `<span class="row-label" title="${k}">${k.length > 20 ? k.slice(0,18) + '…' : k}</span><span class="val ${color}">${fmt(v)}</span>`;
+    if (drillFn) li.onclick = () => drillFn(k, v);
+    el.appendChild(li);
+  });
+}
+
+// ─── GEO MAP ──────────────────────────────────────────────────────────────────
+let geoMap        = null;
+let geoMarkersLayer = null;
+let _pendingGeoPoints = null;  // store data while map isn't ready yet
+
+function updateGeoMap() {
+  // ── Aggregate cell tower locations ──────────────────────────────────────
+  const cellGeo = {};
+  filteredData.forEach(r => {
+    const lat = parseFloat(getVal(r,'lat'));
+    const lon = parseFloat(getVal(r,'lon'));
+    if (isNaN(lat) || isNaN(lon) || lat === 0 || lon === 0) return;
+    const cellId = getVal(r,'cellIdA') || `${lat.toFixed(4)},${lon.toFixed(4)}`;
+    if (!cellGeo[cellId]) {
+      cellGeo[cellId] = { lat, lon, hits:0, subs:new Set(),
+                          addr: getVal(r,'address')||'', types:{} };
+    }
+    cellGeo[cellId].hits++;
+    const a = getVal(r,'aParty'); if(a) cellGeo[cellId].subs.add(a);
+    const ct = getVal(r,'callType')||'Unknown';
+    cellGeo[cellId].types[ct] = (cellGeo[cellId].types[ct]||0)+1;
+  });
+
+  const points    = Object.entries(cellGeo);
+  const noDataEl  = document.getElementById('geo-no-data');
+  const mapCon    = document.getElementById('geo-map-container');
+  const countEl   = document.getElementById('geo-point-count');
+
+  if (points.length === 0) {
+    mapCon.style.display   = 'none';
+    noDataEl.style.display = 'flex';
+    countEl.textContent    = '';
+    return;
+  }
+
+  mapCon.style.display   = 'block';
+  noDataEl.style.display = 'none';
+  countEl.textContent    = points.length.toLocaleString() + ' TOWERS PLOTTED';
+
+  // Store points so the deferred init can use them
+  _pendingGeoPoints = points;
+
+  // ── Initialise Leaflet (destroy old instance so sizing is clean) ─────────
+  if (geoMap) {
+    geoMap.remove();
+    geoMap = null;
+    geoMarkersLayer = null;
+  }
+
+  // Re-create the map div (removing it clears Leaflet's internal state)
+  const mapEl = document.getElementById('geo-map');
+  const parent = mapEl.parentNode;
+  const newMapEl = document.createElement('div');
+  newMapEl.id = 'geo-map';
+  parent.replaceChild(newMapEl, mapEl);
+
+  // Defer init by one frame so the browser has laid out the new element
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      _renderGeoMap(_pendingGeoPoints);
+    });
+  });
+}
+
+function _renderGeoMap(points) {
+  // Guard: Leaflet didn't load (no internet)
+  if (typeof L === 'undefined') {
+    const geoEl = document.getElementById('geo-map');
+    if (geoEl) {
+      geoEl.style.cssText = 'display:flex;align-items:center;justify-content:center;' +
+        'color:#3d6478;font-family:Share Tech Mono,monospace;font-size:12px;letter-spacing:2px;flex-direction:column;gap:8px;';
+      geoEl.innerHTML = '<span style="font-size:28px;opacity:0.3;">🗺</span>' +
+        '<span>MAP REQUIRES INTERNET CONNECTION</span>' +
+        '<span style="font-size:10px;opacity:0.6;">Leaflet.js could not load from CDN</span>';
+    }
+    const cnt = document.getElementById('geo-point-count');
+    if (cnt) cnt.textContent = points.length + ' TOWERS (map offline)';
+    return;
+  }
+
+  const mapEl = document.getElementById('geo-map');
+  if (!mapEl || mapEl.offsetWidth === 0) {
+    // Still not visible — retry after a short delay
+    setTimeout(() => _renderGeoMap(points), 200);
+    return;
+  }
+
+  // Create map
+  geoMap = L.map('geo-map', {
+    zoomControl      : true,
+    scrollWheelZoom  : true,
+    attributionControl: true,
+  });
+
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '© <a href="https://openstreetmap.org">OpenStreetMap</a>',
+    maxZoom: 18,
+  }).addTo(geoMap);
+
+  geoMarkersLayer = L.layerGroup().addTo(geoMap);
+
+  // ── Plot markers ──────────────────────────────────────────────────────
+  const maxHits = Math.max(...points.map(([,v]) => v.hits));
+
+  const markerColour = hits => {
+    const r = hits / maxHits;
+    if (r > 0.75) return '#ff6b35';
+    if (r > 0.40) return '#ffd93d';
+    if (r > 0.15) return '#00ff9d';
+    return '#00f5ff';
+  };
+
+  const markerRadius = hits =>
+    Math.max(6, Math.min(22, 6 + 16 * Math.sqrt(hits / maxHits)));
+
+  const bounds = [];
+
+  points.forEach(([cellId, v]) => {
+    const colour = markerColour(v.hits);
+    const domType = Object.entries(v.types).sort((a,b)=>b[1]-a[1])[0];
+
+    const marker = L.circleMarker([v.lat, v.lon], {
+      radius     : markerRadius(v.hits),
+      fillColor  : colour,
+      color      : colour,
+      weight     : 1.5,
+      opacity    : 0.9,
+      fillOpacity: 0.55,
+    });
+
+    marker.bindPopup(`
+      <div style="font-family:'Courier New',monospace;font-size:11px;min-width:180px;color:#111;line-height:1.7;">
+        <div style="font-weight:bold;font-size:12px;border-bottom:1px solid #ccc;padding-bottom:4px;margin-bottom:6px;">
+          📡 ${cellId}
+        </div>
+        ${v.addr ? `<div>📍 ${v.addr}</div>` : ''}
+        <div>🔢 <b>${v.hits.toLocaleString()}</b> hits</div>
+        <div>👥 <b>${v.subs.size}</b> unique subscribers</div>
+        ${domType ? `<div>📞 ${domType[0]} (${domType[1]})</div>` : ''}
+        <div style="color:#666;font-size:10px;margin-top:4px;">
+          ${v.lat.toFixed(5)}, ${v.lon.toFixed(5)}
+        </div>
+      </div>`, { maxWidth: 240 });
+
+    marker.on('click', () => {
+      openDrill(`CELL TOWER: ${cellId}`,
+        filteredData.filter(r => {
+          const la = parseFloat(getVal(r,'lat'));
+          const lo = parseFloat(getVal(r,'lon'));
+          return Math.abs(la - v.lat) < 0.0001 && Math.abs(lo - v.lon) < 0.0001;
+        })
+      );
+    });
+
+    geoMarkersLayer.addLayer(marker);
+    bounds.push([v.lat, v.lon]);
+  });
+
+  // ── Fit bounds ────────────────────────────────────────────────────────
+  if (bounds.length === 1) {
+    geoMap.setView(bounds[0], 13);
+  } else if (bounds.length > 1) {
+    geoMap.fitBounds(bounds, { padding: [20, 20], maxZoom: 14 });
+  }
+
+  // Final size correction
+  setTimeout(() => { if (geoMap) geoMap.invalidateSize(); }, 100);
+}
+
+// ─── CHART CLICK-DRILL ───────────────────────────────────────────────────────
+// Each chart canvas gets a click listener that figures out which bar/segment was clicked
+function attachChartClick(chartKey, canvas, labelFn, filterFn) {
+  canvas.onclick = function(evt) {
+    const ch = charts[chartKey];
+    if (!ch) return;
+    const pts = ch.getElementsAtEventForMode(evt, 'nearest', { intersect: true }, false);
+    if (!pts.length) return;
+    const idx = pts[0].index;
+    const label = ch.data.labels[idx];
+    const rows = filteredData.filter(r => filterFn(r, label, idx));
+    openDrill(labelFn(label), rows);
+    evt.stopPropagation();
+  };
+}
+
+// We re-attach after each chart rebuild — called inside each update function via a tiny hook
+function hookChartClicks() {
+  // Timeline — click on a date bar/point
+  const tl = document.getElementById('chart-timeline');
+  if (tl && charts.timeline) {
+    tl.onclick = function(evt) {
+      const ch = charts.timeline;
+      const pts = ch.getElementsAtEventForMode(evt,'nearest',{intersect:false},false);
+      if (!pts.length) return;
+      const label = ch.data.labels[pts[0].index];
+      openDrill(`DATE: ${label}`, filteredData.filter(r => getVal(r,'date') === label));
+      evt.stopPropagation();
+    };
+  }
+
+  // Call type doughnut
+  const ct = document.getElementById('chart-calltype');
+  if (ct && charts.calltype) {
+    ct.onclick = function(evt) {
+      const ch = charts.calltype;
+      const pts = ch.getElementsAtEventForMode(evt,'nearest',{intersect:true},false);
+      if (!pts.length) return;
+      const label = ch.data.labels[pts[0].index];
+      openDrill(`CALL TYPE: ${label}`, filteredData.filter(r => (getVal(r,'callType')||'Unknown') === label));
+      evt.stopPropagation();
+    };
+  }
+
+  // Hourly bar
+  const hr = document.getElementById('chart-hourly');
+  if (hr && charts.hourly) {
+    hr.onclick = function(evt) {
+      const ch = charts.hourly;
+      const pts = ch.getElementsAtEventForMode(evt,'nearest',{intersect:true},false);
+      if (!pts.length) return;
+      const hNum = pts[0].index;
+      openDrill(`HOUR: ${String(hNum).padStart(2,'0')}:00`, filteredData.filter(r => {
+        const t = getVal(r,'time'); if(!t) return false;
+        return parseInt(t.split(':')[0]) === hNum;
+      }));
+      evt.stopPropagation();
+    };
+  }
+
+  // Top subscribers bar
+  const ts = document.getElementById('chart-top-subscribers');
+  if (ts && charts.topSubs) {
+    // store full labels alongside
+    ts.onclick = function(evt) {
+      const ch = charts.topSubs;
+      const pts = ch.getElementsAtEventForMode(evt,'nearest',{intersect:true},false);
+      if (!pts.length) return;
+      // full label stored in chart dataset's custom meta
+      const fullLabel = ch._drillLabels ? ch._drillLabels[pts[0].index] : ch.data.labels[pts[0].index];
+      openDrill(`SUBSCRIBER: ${fullLabel}`, filteredData.filter(r => getVal(r,'aParty') === fullLabel));
+      evt.stopPropagation();
+    };
+  }
+
+  // Duration histogram
+  const dh = document.getElementById('chart-duration-dist');
+  if (dh && charts.durHist) {
+    dh.onclick = function(evt) {
+      const ch = charts.durHist;
+      const pts = ch.getElementsAtEventForMode(evt,'nearest',{intersect:true},false);
+      if (!pts.length) return;
+      const bins = [0,30,60,120,300,600,1800,3600,Infinity];
+      const labels = ['0-30s','30s-1m','1-2m','2-5m','5-10m','10-30m','30m-1h','1h+'];
+      const i = pts[0].index;
+      openDrill(`DURATION: ${labels[i]}`, filteredData.filter(r => {
+        const d = parseDuration(getVal(r,'duration'));
+        return d >= bins[i] && d < bins[i+1];
+      }));
+      evt.stopPropagation();
+    };
+  }
+}
+
+// Patch updateTopSubscribersChart to store full labels
+const _origTopSubs = updateTopSubscribersChart;
+function updateTopSubscribersChart() {
+  destroyChart('topSubs');
+  const by = {};
+  filteredData.forEach(r => { const a = getVal(r,'aParty'); if(a) by[a] = (by[a]||0)+1; });
+  const sorted = Object.entries(by).sort((a,b)=>b[1]-a[1]).slice(0,10);
+  const fullLabels = sorted.map(([k]) => k);
+  const labels = sorted.map(([k]) => k.slice(-10));
+  const vals = sorted.map(([,v]) => v);
+  const ctx = document.getElementById('chart-top-subscribers').getContext('2d');
+  charts.topSubs = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [{
+        label: 'Calls',
+        data: vals,
+        backgroundColor: labels.map((_,i) => i===0 ? C.cyan : `rgba(0,245,255,${0.65-i*0.055})`),
+        borderColor: C.cyan,
+        borderWidth: 1,
+        borderRadius: 3
+      }]
+    },
+    options: {
+      indexAxis: 'y',
+      ...chartDefaults(),
+      maintainAspectRatio: false,
+      plugins: { ...chartDefaults().plugins, legend: { display: false } }
+    }
+  });
+  charts.topSubs._drillLabels = fullLabels;
+  hookChartClicks();
+}
+
+// ─── MODAL ENGINE ─────────────────────────────────────────────────────────────
+let modalData = [];
+let modalSortCol = null, modalSortDir = 1;
+
+function openDrill(title, rows) {
+  modalData = rows;
+  modalSortCol = null; modalSortDir = 1;
+  document.getElementById('modal-title').textContent = '◈ ' + title;
+  document.getElementById('modal-search').value = '';
+  document.getElementById('drill-modal').classList.add('open');
+  document.body.style.overflow = 'hidden';
+  renderModalTable();
+}
+
+function closeDrill() {
+  document.getElementById('drill-modal').classList.remove('open');
+  document.body.style.overflow = '';
+}
+
+function closeDrillIfOutside(e) {
+  if (e.target === document.getElementById('drill-modal')) closeDrill();
+}
+
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDrill(); });
+
+function renderModalTable() {
+  const q = document.getElementById('modal-search').value.toLowerCase();
+  let rows = modalData.filter(r => !q || Object.values(r).some(v => (v||'').toString().toLowerCase().includes(q)));
+
+  if (modalSortCol) {
+    rows.sort((a,b) => {
+      const av = (a[modalSortCol]||'').toString();
+      const bv = (b[modalSortCol]||'').toString();
+      return av.localeCompare(bv, undefined, {numeric:true}) * modalSortDir;
+    });
+  }
+
+  document.getElementById('modal-meta').textContent = `${rows.length.toLocaleString()} RECORDS`;
+  document.getElementById('modal-count').textContent = q ? `${rows.length} of ${modalData.length} shown` : '';
+
+  if (!rows.length && !rawData.length) return;
+  const headers = rawData.length ? Object.keys(rawData[0]) : [];
+
+  document.getElementById('modal-thead').innerHTML = headers.map(h =>
+    `<th onclick="modalSort('${h}')">${h} ${modalSortCol===h?(modalSortDir>0?'▲':'▼'):''}</th>`
+  ).join('');
+
+  const tbody = document.getElementById('modal-tbody');
+  if (!rows.length) {
+    tbody.innerHTML = `<tr><td colspan="${headers.length}" class="no-data">NO RECORDS FOUND</td></tr>`;
+    return;
+  }
+
+  tbody.innerHTML = rows.slice(0, 500).map(r =>
+    '<tr>' + headers.map(h => {
+      let v = (r[h]||'').toString();
+      if (h.toUpperCase().includes('ROAMING') && isRoaming(v)) v = `<span class="badge badge-roaming">ROAM</span>`;
+      else if (h.toUpperCase().includes('TYPE')) {
+        const t = v.toLowerCase();
+        if (t.includes('sms')) v = `<span class="badge badge-sms">${v}</span>`;
+        else if (t.includes('voice')||t.includes('call')) v = `<span class="badge badge-voice">${v}</span>`;
+        else if (v) v = `<span class="badge badge-data">${v}</span>`;
+      }
+      return `<td title="${r[h]}">${v}</td>`;
+    }).join('') + '</tr>'
+  ).join('');
+}
+
+function modalSort(col) {
+  if (modalSortCol === col) modalSortDir *= -1;
+  else { modalSortCol = col; modalSortDir = 1; }
+  renderModalTable();
+}
+
+function exportModalCSV() {
+  if (!modalData.length) return;
+  const q = document.getElementById('modal-search').value.toLowerCase();
+  const rows = modalData.filter(r => !q || Object.values(r).some(v => (v||'').toString().toLowerCase().includes(q)));
+  const headers = Object.keys(rawData[0]);
+  const csv = [headers.join(','), ...rows.map(r => headers.map(h => `"${(r[h]||'').toString().replace(/"/g,'""')}"`).join(','))].join('\n');
+  const a = document.createElement('a');
+  a.href = 'data:text/csv;charset=utf-8,' + encodeURIComponent(csv);
+  a.download = 'cdr_drill_export.csv';
+  a.click();
+}
+
+// ─── CHART DRILL from card-level click (fallback if not clicking a bar) ───────
+function drillChart(key) {
+  // Only fires if user clicks the card itself (not a specific bar/segment)
+  // Already handled per-element by hookChartClicks, so this is a safety net for empty area clicks
+  const titleMap = {
+    timeline: 'ALL TIMELINE RECORDS',
+    calltype: 'ALL CALL TYPE RECORDS',
+    hourly: 'ALL HOURLY RECORDS',
+    topSubs: 'ALL SUBSCRIBER RECORDS',
+    durHist: 'ALL DURATION RECORDS'
+  };
+  openDrill(titleMap[key] || 'ALL RECORDS', filteredData);
+}
+
+// Hook chart clicks after every chart update
+const _origUpdateCharts = updateCharts;
+function updateCharts() {
+  updateTimelineChart();
+  updateCallTypeChart();
+  updateHourlyChart();
+  updateTopSubscribersChart();
+  updateDurationHistChart();
+  setTimeout(hookChartClicks, 100);
+}
+let sortCol = null, sortDir = 1;
+
+function renderTable() {
+  const q = document.getElementById('table-search').value.toLowerCase();
+  let rows = sortedData.filter(r => !q || Object.values(r).some(v => (v||'').toString().toLowerCase().includes(q)));
+
+  if (sortCol) {
+    rows.sort((a,b) => {
+      const av = (a[sortCol]||'').toString();
+      const bv = (b[sortCol]||'').toString();
+      return av.localeCompare(bv, undefined, {numeric:true}) * sortDir;
+    });
+  }
+
+  const total = rows.length;
+  const pages = Math.ceil(total / PAGE_SIZE);
+  if (currentPage > pages) currentPage = 1;
+
+  const pageRows = rows.slice((currentPage-1)*PAGE_SIZE, currentPage*PAGE_SIZE);
+  document.getElementById('table-info').textContent = `${total.toLocaleString()} records`;
+
+  if (!rawData.length) return;
+  const headers = Object.keys(rawData[0]);
+  const thead = document.getElementById('table-head');
+  thead.innerHTML = headers.slice(0,10).map(h =>
+    `<th onclick="sortTable('${h}')">${h} ${sortCol===h ? (sortDir>0?'▲':'▼') : ''}</th>`
+  ).join('');
+
+  const tbody = document.getElementById('table-body');
+  if (!pageRows.length) {
+    tbody.innerHTML = `<tr><td colspan="${Math.min(headers.length,10)}" class="no-data">NO RECORDS FOUND</td></tr>`;
+  } else {
+    tbody.innerHTML = pageRows.map(r => {
+      const cells = headers.slice(0,10).map(h => {
+        let v = (r[h]||'').toString();
+        if (h.toUpperCase().includes('ROAMING') && isRoaming(v)) v = `<span class="badge badge-roaming">ROAM</span>`;
+        else if (h.toUpperCase().includes('TYPE')) {
+          const t = v.toLowerCase();
+          if (t.includes('sms')) v = `<span class="badge badge-sms">${v}</span>`;
+          else if (t.includes('voice')||t.includes('call')) v = `<span class="badge badge-voice">${v}</span>`;
+          else if (v) v = `<span class="badge badge-data">${v}</span>`;
+        }
+        return `<td title="${r[h]}">${v}</td>`;
+      }).join('');
+      return `<tr>${cells}</tr>`;
+    }).join('');
+  }
+
+  // Pagination
+  const pg = document.getElementById('pagination');
+  let btns = '';
+  if (pages > 1) {
+    btns += `<button class="page-btn" onclick="changePage(${currentPage-1})" ${currentPage===1?'disabled':''}>◀</button>`;
+    for (let i=Math.max(1,currentPage-2); i<=Math.min(pages,currentPage+2); i++) {
+      btns += `<button class="page-btn ${i===currentPage?'active':''}" onclick="changePage(${i})">${i}</button>`;
+    }
+    btns += `<button class="page-btn" onclick="changePage(${currentPage+1})" ${currentPage===pages?'disabled':''}>▶</button>`;
+  }
+  pg.innerHTML = btns;
+}
+
+function sortTable(col) {
+  if (sortCol === col) sortDir *= -1;
+  else { sortCol = col; sortDir = 1; }
+  renderTable();
+}
+
+function changePage(p) {
+  const q = document.getElementById('table-search').value.toLowerCase();
+  const rows = sortedData.filter(r => !q || Object.values(r).some(v => (v||'').toString().toLowerCase().includes(q)));
+  const pages = Math.ceil(rows.length / PAGE_SIZE);
+  if (p >= 1 && p <= pages) { currentPage = p; renderTable(); }
+}
+
+// ─── REPORT TAB SWITCH ────────────────────────────────────────────────────────
+let activeReportTab = 'top-calling-tab';
+function switchReportTab(id, btn) {
+  document.querySelectorAll('.report-tab-content').forEach(el => el.style.display = 'none');
+  document.querySelectorAll('.rtab').forEach(b => b.classList.remove('active'));
+  document.getElementById(id).style.display = 'block';
+  btn.classList.add('active');
+  activeReportTab = id;
+}
+
+// ─── TOP N TOGGLE ────────────────────────────────────────────────────────────
+function setTopN(n) {
+  currentTopN = n;
+  const btns = { 10: 'top10-btn', 20: 'top20-btn' };
+  Object.entries(btns).forEach(([val, id]) => {
+    const b = document.getElementById(id);
+    const on = parseInt(val) === n;
+    b.style.background = on ? 'rgba(0,245,255,0.08)' : '';
+    b.style.borderColor = on ? 'var(--accent-cyan)' : '';
+    b.style.color = on ? 'var(--accent-cyan)' : '';
+    b.style.borderStyle = 'solid';
+  });
+  updateReportTables();
+}
+
+// ─── REPORT TABLES ────────────────────────────────────────────────────────────
+function updateReportTables() {
+  const N = currentTopN || 10;
+
+  // ── Top Calling Numbers (A Party) ──
+  const callingMap = {};
+  filteredData.forEach(r => {
+    const a = getVal(r,'aParty'); if (!a) return;
+    if (!callingMap[a]) callingMap[a] = { calls:0, dur:0, bParties:new Set(), roam:0, types:new Set() };
+    callingMap[a].calls++;
+    callingMap[a].dur += parseDuration(getVal(r,'duration'));
+    callingMap[a].bParties.add(getVal(r,'bParty'));
+    if (isRoaming(getVal(r,'roaming'))) callingMap[a].roam++;
+    const ct = getVal(r,'callType'); if (ct) callingMap[a].types.add(ct);
+  });
+  const callingRows = Object.entries(callingMap).sort((a,b)=>b[1].calls-a[1].calls).slice(0,N);
+  document.getElementById('rt-calling-body').innerHTML = callingRows.map(([k,v],i) => `
+    <tr style="cursor:pointer;" title="Click to drill down" onclick="openDrill('CALLING: ${escQ(k)}',filteredData.filter(r=>getVal(r,'aParty')==='${escQ(k)}'))">
+      <td class="rank">${i+1}</td>
+      <td class="num">${k}</td>
+      <td class="num">${v.calls.toLocaleString()}</td>
+      <td class="dur-val">${formatDur(v.dur)}</td>
+      <td class="dur-val">${formatDur(Math.round(v.dur/v.calls))}</td>
+      <td class="cell-val">${v.bParties.size}</td>
+      <td style="color:${v.roam>0?'var(--accent-orange)':'var(--text-dim)'}">${v.roam}</td>
+      <td style="color:var(--accent-purple);font-size:11px;">${[...v.types].join(', ')||'—'}</td>
+    </tr>`).join('') || '<tr><td colspan="8" class="no-data">No data</td></tr>';
+
+  // ── Top Called Numbers (B Party) ──
+  const bMap = {};
+  filteredData.forEach(r => {
+    const b = getVal(r,'bParty'); if (!b) return;
+    if (!bMap[b]) bMap[b] = { calls:0, dur:0, callers:new Set(), dates:[], types:new Set() };
+    bMap[b].calls++;
+    bMap[b].dur += parseDuration(getVal(r,'duration'));
+    bMap[b].callers.add(getVal(r,'aParty'));
+    const d = getVal(r,'date'); if (d) bMap[b].dates.push(d);
+    const ct = getVal(r,'callType'); if (ct) bMap[b].types.add(ct);
+  });
+  const bRows = Object.entries(bMap).sort((a,b)=>b[1].calls-a[1].calls).slice(0,N);
+  document.getElementById('rt-called-body').innerHTML = bRows.map(([k,v],i) => {
+    const ds = v.dates.sort();
+    return `<tr style="cursor:pointer;" title="Click to drill down" onclick="openDrill('CALLED: ${escQ(k)}',filteredData.filter(r=>getVal(r,'bParty')==='${escQ(k)}'))">
+      <td class="rank">${i+1}</td>
+      <td class="num">${k}</td>
+      <td class="num">${v.calls.toLocaleString()}</td>
+      <td class="dur-val">${formatDur(v.dur)}</td>
+      <td class="cell-val">${v.callers.size}</td>
+      <td style="color:var(--text-dim);font-size:11px;">${ds[0]||'—'}</td>
+      <td style="color:var(--text-dim);font-size:11px;">${ds[ds.length-1]||'—'}</td>
+      <td style="color:var(--accent-purple);font-size:11px;">${[...v.types].join(', ')||'—'}</td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="8" class="no-data">No data</td></tr>';
+
+  // ── Top Cell Towers ──
+  const cellMap = {};
+  filteredData.forEach(r => {
+    const c = getVal(r,'cellIdA'); if (!c) return;
+    if (!cellMap[c]) cellMap[c] = { hits:0, subs:new Set(), dur:0, roam:0, addr:'', types:new Set() };
+    cellMap[c].hits++;
+    cellMap[c].subs.add(getVal(r,'aParty'));
+    cellMap[c].dur += parseDuration(getVal(r,'duration'));
+    if (isRoaming(getVal(r,'roaming'))) cellMap[c].roam++;
+    if (!cellMap[c].addr && getVal(r,'address')) cellMap[c].addr = getVal(r,'address');
+    const ct = getVal(r,'callType'); if (ct) cellMap[c].types.add(ct);
+  });
+  const cellRows = Object.entries(cellMap).sort((a,b)=>b[1].hits-a[1].hits).slice(0,N);
+  document.getElementById('rt-cells-body').innerHTML = cellRows.map(([k,v],i) => `
+    <tr style="cursor:pointer;" title="Click to drill down" onclick="openDrill('CELL ID: ${escQ(k)}',filteredData.filter(r=>getVal(r,'cellIdA')==='${escQ(k)}'))">
+      <td class="rank">${i+1}</td>
+      <td class="cell-val">${k}</td>
+      <td style="color:var(--text-dim);font-size:11px;" title="${v.addr}">${v.addr ? (v.addr.length>35?v.addr.slice(0,33)+'…':v.addr) : '—'}</td>
+      <td class="num">${v.hits.toLocaleString()}</td>
+      <td class="num">${v.subs.size}</td>
+      <td class="dur-val">${formatDur(v.dur)}</td>
+      <td style="color:${v.roam>0?'var(--accent-orange)':'var(--text-dim)'}">${v.roam}</td>
+      <td style="color:var(--accent-purple);font-size:11px;">${[...v.types].join(', ')||'—'}</td>
+    </tr>`).join('') || '<tr><td colspan="8" class="no-data">No data</td></tr>';
+
+  // ── Longest Calls ──
+  const longList = filteredData
+    .map(r => ({ a:getVal(r,'aParty'), b:getVal(r,'bParty'), date:getVal(r,'date'), time:getVal(r,'time'),
+                 d:parseDuration(getVal(r,'duration')), cell:getVal(r,'cellIdA'), type:getVal(r,'callType'), _r:r }))
+    .sort((a,b)=>b.d-a.d).slice(0,N);
+  document.getElementById('rt-longest-body').innerHTML = longList.map((c,i) => `
+    <tr style="cursor:pointer;" title="Click to drill down" onclick="openDrill('CALL: ${escQ(c.a||'')} → ${escQ(c.b||'')}', [filteredData[${filteredData.indexOf(c._r)}]])">
+      <td class="rank">${i+1}</td>
+      <td class="num">${c.a||'—'}</td>
+      <td class="num">${c.b||'—'}</td>
+      <td style="color:var(--text-dim)">${c.date||'—'}</td>
+      <td style="color:var(--text-dim)">${c.time||'—'}</td>
+      <td class="dur-val">${formatDur(c.d)}</td>
+      <td class="cell-val">${c.cell||'—'}</td>
+      <td style="color:var(--accent-purple)">${c.type||'—'}</td>
+    </tr>`).join('') || '<tr><td colspan="8" class="no-data">No data</td></tr>';
+
+  // ── Top IMEI Devices ──
+  const imeiMap = {};
+  filteredData.forEach(r => {
+    const im = getVal(r,'imei'); if (!im) return;
+    if (!imeiMap[im]) imeiMap[im] = { calls:0, subs:new Set(), dur:0, roam:0, imsi:'', dates:[] };
+    imeiMap[im].calls++;
+    imeiMap[im].subs.add(getVal(r,'aParty'));
+    imeiMap[im].dur += parseDuration(getVal(r,'duration'));
+    if (isRoaming(getVal(r,'roaming'))) imeiMap[im].roam++;
+    if (!imeiMap[im].imsi && getVal(r,'imsi')) imeiMap[im].imsi = getVal(r,'imsi');
+    const d = getVal(r,'date'); if (d) imeiMap[im].dates.push(d);
+  });
+  const imeiRows = Object.entries(imeiMap).sort((a,b)=>b[1].calls-a[1].calls).slice(0,N);
+  document.getElementById('rt-imei-body').innerHTML = imeiRows.map(([k,v],i) => {
+    const ds = v.dates.sort();
+    return `<tr style="cursor:pointer;" title="Click to drill down" onclick="openDrill('IMEI: ${escQ(k)}',filteredData.filter(r=>getVal(r,'imei')==='${escQ(k)}'))">
+      <td class="rank">${i+1}</td>
+      <td class="num">${k}</td>
+      <td style="color:var(--text-dim);font-size:11px;">${v.imsi||'—'}</td>
+      <td class="num">${v.calls.toLocaleString()}</td>
+      <td class="cell-val">${v.subs.size}</td>
+      <td class="dur-val">${formatDur(v.dur)}</td>
+      <td style="color:${v.roam>0?'var(--accent-orange)':'var(--text-dim)'}">${v.roam}</td>
+      <td style="color:var(--text-dim);font-size:11px;">${ds[ds.length-1]||'—'}</td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="8" class="no-data">No data</td></tr>';
+
+  // ── Top Locations (by Address field) ──
+  const locMap = {};
+  filteredData.forEach(r => {
+    const addr = (getVal(r,'address')||'').trim(); if (!addr || addr === '—') return;
+    // Normalise: use first part before comma as location key but store full address
+    if (!locMap[addr]) locMap[addr] = { hits:0, subs:new Set(), cells:new Set(), dur:0, roam:0, types:{} };
+    locMap[addr].hits++;
+    locMap[addr].subs.add(getVal(r,'aParty'));
+    locMap[addr].cells.add(getVal(r,'cellIdA'));
+    locMap[addr].dur += parseDuration(getVal(r,'duration'));
+    if (isRoaming(getVal(r,'roaming'))) locMap[addr].roam++;
+    const ct = getVal(r,'callType'); if (ct) locMap[addr].types[ct] = (locMap[addr].types[ct]||0)+1;
+  });
+  const locRows = Object.entries(locMap).sort((a,b)=>b[1].hits-a[1].hits).slice(0,N);
+  document.getElementById('rt-location-body').innerHTML = locRows.length
+    ? locRows.map(([k,v],i) => {
+        const domType = Object.entries(v.types).sort((a,b)=>b[1]-a[1])[0];
+        return `<tr style="cursor:pointer;" title="${k}" onclick="openDrill('LOCATION: ${escQ(k)}',filteredData.filter(r=>(getVal(r,'address')||'').trim()==='${escQ(k)}'))">
+          <td class="rank">${i+1}</td>
+          <td style="color:var(--accent-yellow);font-size:11px;max-width:220px;white-space:normal;line-height:1.3;" title="${k}">${k}</td>
+          <td class="num">${v.hits.toLocaleString()}</td>
+          <td class="cell-val">${v.subs.size}</td>
+          <td class="cell-val">${v.cells.size}</td>
+          <td class="dur-val">${formatDur(v.dur)}</td>
+          <td style="color:${v.roam>0?'var(--accent-orange)':'var(--text-dim)'}">${v.roam}</td>
+          <td style="color:var(--accent-purple);font-size:11px;">${domType?domType[0]:'—'}</td>
+        </tr>`;
+      }).join('')
+    : '<tr><td colspan="8" class="no-data">No address data found in dataset</td></tr>';
+}
+
+// helper: escape quotes for inline onclick
+function escQ(s) { return (s||'').replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/"/g,'&quot;'); }
+
+// ─── FORMSPREE CONFIG ────────────────────────────────────────────────────────
+//
+//  SETUP (2 minutes, completely free):
+//  1. Go to https://formspree.io and sign up / log in
+//  2. Click "New Form" → give it a name (e.g. "CDR Dashboard Contacts")
+//  3. Copy your Form Endpoint — looks like:
+//        https://formspree.io/f/abcdefgh
+//  4. Paste it below as FORMSPREE_ENDPOINT
+//  5. Formspree emails you every submission AND stores all responses in
+//     your dashboard at formspree.io — no extra setup needed.
+//
+//  Free tier: 50 submissions/month. Upgrade for more.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const FORMSPREE_ENDPOINT = 'https://formspree.io/f/YOUR_FORM_ID';
+// Example: const FORMSPREE_ENDPOINT = 'https://formspree.io/f/xpwzgkrd';
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+function triggerDownload() {
+  if (!filteredData.length) { alert('Please upload a CDR file first.'); return; }
+  ['c-name','c-org','c-email','c-phone','c-purpose'].forEach(id => {
+    const el = document.getElementById(id);
+    el.value = ''; el.classList.remove('err-field');
+  });
+  setContactStatus('', '');
+  document.getElementById('c-submit-btn').disabled = false;
+  document.getElementById('contact-modal').classList.add('open');
+  document.body.style.overflow = 'hidden';
+}
+
+function closeContactModal() {
+  document.getElementById('contact-modal').classList.remove('open');
+  document.body.style.overflow = '';
+}
+
+function setContactStatus(msg, cls) {
+  const el = document.getElementById('contact-status');
+  el.textContent = msg;
+  el.className = 'contact-status' + (cls ? ' ' + cls : '');
+}
+
+async function submitContact() {
+  const name    = document.getElementById('c-name').value.trim();
+  const org     = document.getElementById('c-org').value.trim();
+  const email   = document.getElementById('c-email').value.trim();
+  const phone   = document.getElementById('c-phone').value.trim();
+  const purpose = document.getElementById('c-purpose').value.trim() || 'Not specified';
+
+  // Clear previous error highlights
+  ['c-name','c-org','c-email','c-phone'].forEach(id =>
+    document.getElementById(id).classList.remove('err-field'));
+
+  // Validate required fields
+  let hasErr = false;
+  if (!name)  { document.getElementById('c-name').classList.add('err-field');  hasErr = true; }
+  if (!org)   { document.getElementById('c-org').classList.add('err-field');   hasErr = true; }
+  if (!email) { document.getElementById('c-email').classList.add('err-field'); hasErr = true; }
+  if (!phone) { document.getElementById('c-phone').classList.add('err-field'); hasErr = true; }
+  if (hasErr) { setContactStatus('⚠  Please fill all required fields.', 'err'); return; }
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    document.getElementById('c-email').classList.add('err-field');
+    setContactStatus('⚠  Please enter a valid email address.', 'err'); return;
+  }
+
+  document.getElementById('c-submit-btn').disabled = true;
+  setContactStatus('⏳  Submitting your details…', '');
+
+  // Always keep a local backup regardless of what happens
+  try {
+    const saved = JSON.parse(localStorage.getItem('cdr_contacts') || '[]');
+    saved.push({ name, org, email, phone, purpose,
+      records: filteredData.length, ts: new Date().toISOString() });
+    localStorage.setItem('cdr_contacts', JSON.stringify(saved));
+  } catch(_) {}
+
+  // Not configured yet — skip network call
+  if (FORMSPREE_ENDPOINT.includes('YOUR_FORM_ID')) {
+    setContactStatus('⚠  Formspree not configured yet — saved locally. Generating PDF…', 'err');
+    setTimeout(() => { closeContactModal(); generatePDF(); }, 1600);
+    return;
+  }
+
+  // POST to Formspree
+  try {
+    const res = await fetch(FORMSPREE_ENDPOINT, {
+      method : 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept'       : 'application/json'
+      },
+      body: JSON.stringify({
+        name, org, email, phone, purpose,
+        _subject : `CDR Dashboard Download — ${name}`,
+        records  : filteredData.length,
+        timestamp: new Date().toLocaleString()
+      })
+    });
+
+    if (res.ok) {
+      setContactStatus('✓  Details received! Generating your PDF…', 'ok');
+      setTimeout(() => { closeContactModal(); generatePDF(); }, 1000);
+    } else {
+      // Parse Formspree error message if available
+      let errMsg = `Error ${res.status}`;
+      try { const j = await res.json(); errMsg = j.error || errMsg; } catch(_) {}
+      throw new Error(errMsg);
+    }
+
+  } catch(err) {
+    console.error('Formspree error:', err);
+    setContactStatus(`⚠  ${err.message} — saved locally. Generating PDF…`, 'err');
+    setTimeout(() => { closeContactModal(); generatePDF(); }, 1600);
+  }
+}
+
+// ─── PDF GENERATION ───────────────────────────────────────────────────────────
+function generatePDF() {
+  if (!window.jspdf || typeof window.jspdf.jsPDF === 'undefined') {
+    alert('PDF generation requires an internet connection to load the jsPDF library.\nPlease connect to the internet and try again.');
+    return;
+  }
+  const { jsPDF } = window.jspdf;
+  const doc  = new jsPDF({ orientation:'portrait', unit:'mm', format:'a4' });
+  const W    = doc.internal.pageSize.getWidth();   // 210
+  const H    = doc.internal.pageSize.getHeight();  // 297
+  const ML   = 14;   // margin left
+  const MR   = 14;   // margin right
+  const TW   = W - ML - MR;
+  const now  = new Date().toLocaleString('en-IN');
+  const dateStr = new Date().toISOString().slice(0,10);
+
+  // ── Clean monochrome palette ──────────────────────────────────────────────
+  const BLACK      = [0,   0,   0  ];
+  const DARK_GREY  = [40,  40,  40 ];
+  const MID_GREY   = [90,  90,  90 ];
+  const LIGHT_GREY = [160, 160, 160];
+  const RULE_GREY  = [200, 200, 200];
+  const HEAD_BG    = [30,  30,  30 ];   // near-black header fill
+  const ROW_ALT    = [245, 245, 245];   // very light grey alternate row
+  const WHITE      = [255, 255, 255];
+
+  // ── Summary counters ──────────────────────────────────────────────────────
+  let totalCalls = 0, inCalls = 0, outCalls = 0, inSMS = 0, outSMS = 0;
+  filteredData.forEach(r => {
+    const raw = getVal(r,'callType') || '';
+    const cat = resolveCallType(raw);
+    totalCalls++;
+    if      (cat === 'IN_CALL')  inCalls++;
+    else if (cat === 'OUT_CALL') outCalls++;
+    else if (cat === 'IN_SMS')   inSMS++;
+    else if (cat === 'OUT_SMS')  outSMS++;
+    else {
+      // Fallback heuristic when not mapped
+      const ct = raw.toUpperCase();
+      if (ct.includes('SMS')) outSMS++; else outCalls++;
+    }
+  });
+
+  // ── Aggregation helpers ───────────────────────────────────────────────────
+  // Top 20 Called Numbers (B Party)
+  const bMap = {};
+  filteredData.forEach(r => {
+    const b = getVal(r,'bParty'); if(!b) return;
+    if(!bMap[b]) bMap[b] = {calls:0, dur:0, callers:new Set()};
+    bMap[b].calls++; bMap[b].dur += parseDuration(getVal(r,'duration'));
+    bMap[b].callers.add(getVal(r,'aParty'));
+  });
+  const top20Called = Object.entries(bMap).sort((a,b)=>b[1].calls-a[1].calls).slice(0,20);
+
+  // Top 20 Cell IDs
+  const cellMap = {};
+  filteredData.forEach(r => {
+    const c = getVal(r,'cellIdA'); if(!c) return;
+    if(!cellMap[c]) cellMap[c] = {hits:0, subs:new Set(), dur:0, addr:'', roam:0};
+    cellMap[c].hits++; cellMap[c].subs.add(getVal(r,'aParty'));
+    cellMap[c].dur += parseDuration(getVal(r,'duration'));
+    if(!cellMap[c].addr && getVal(r,'address')) cellMap[c].addr = getVal(r,'address');
+    if(isRoaming(getVal(r,'roaming'))) cellMap[c].roam++;
+  });
+  const top20Cells = Object.entries(cellMap).sort((a,b)=>b[1].hits-a[1].hits).slice(0,20);
+
+  // Top 20 IMSI
+  const imsiMap = {};
+  filteredData.forEach(r => {
+    const s = getVal(r,'imsi'); if(!s) return;
+    if(!imsiMap[s]) imsiMap[s] = {calls:0, subs:new Set(), dur:0, roam:0};
+    imsiMap[s].calls++; imsiMap[s].subs.add(getVal(r,'aParty'));
+    imsiMap[s].dur += parseDuration(getVal(r,'duration'));
+    if(isRoaming(getVal(r,'roaming'))) imsiMap[s].roam++;
+  });
+  const top20IMSI = Object.entries(imsiMap).sort((a,b)=>b[1].calls-a[1].calls).slice(0,20);
+
+  // Top 20 IMEI
+  const imeiMap = {};
+  filteredData.forEach(r => {
+    const im = getVal(r,'imei'); if(!im) return;
+    if(!imeiMap[im]) imeiMap[im] = {calls:0, subs:new Set(), dur:0, roam:0, imsi:''};
+    imeiMap[im].calls++; imeiMap[im].subs.add(getVal(r,'aParty'));
+    imeiMap[im].dur += parseDuration(getVal(r,'duration'));
+    if(isRoaming(getVal(r,'roaming'))) imeiMap[im].roam++;
+    if(!imeiMap[im].imsi && getVal(r,'imsi')) imeiMap[im].imsi = getVal(r,'imsi');
+  });
+  const top20IMEI = Object.entries(imeiMap).sort((a,b)=>b[1].calls-a[1].calls).slice(0,20);
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  //  COUNT TOTAL PAGES (only count pages that will actually have content)
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Page 1 = Summary (always exists if there is any data)
+  // Page 2 = Top 20 Called Numbers (skip if no B-party data)
+  // Page 3 = Cell Towers + IMSI (skip whole page if neither has data;
+  //           skip individual section if empty, continue with the other)
+  // Page 4 = IMEI (skip if no IMEI data)
+  const hasCalled = top20Called.length > 0;
+  const hasCells  = top20Cells.length  > 0;
+  const hasIMSI   = top20IMSI.length   > 0;
+  const hasIMEI   = top20IMEI.length   > 0;
+  const hasCellPage = hasCells || hasIMSI;   // page 3 only if at least one section
+
+  let totalPages = 1;
+  if (hasCalled)   totalPages++;
+  if (hasCellPage) totalPages++;
+  if (hasIMEI)     totalPages++;
+
+  let currentPageNum = 0;
+
+  // ── Helper: new page + header, returns starting y ────────────────────────
+  function newPage(title) {
+    if (currentPageNum > 0) doc.addPage();
+    currentPageNum++;
+    return pageHeader(title, currentPageNum, totalPages);
+  }
+
+  // ── autoTable style preset ────────────────────────────────────────────────
+  function tableStyle(startY) {
+    return {
+      startY,
+      margin: { left: ML, right: MR },
+      tableWidth: TW,
+      styles: {
+        fontSize    : 7,
+        cellPadding : { top:2, bottom:2, left:3, right:3 },
+        textColor   : DARK_GREY,
+        fillColor   : WHITE,
+        lineColor   : RULE_GREY,
+        lineWidth   : 0.2,
+        overflow    : 'ellipsize',
+        font        : 'helvetica',
+        fontStyle   : 'normal'
+      },
+      headStyles: {
+        fillColor   : HEAD_BG,
+        textColor   : WHITE,
+        fontSize    : 7,
+        fontStyle   : 'bold',
+        cellPadding : { top:3, bottom:3, left:3, right:3 },
+        lineWidth   : 0
+      },
+      alternateRowStyles : { fillColor: ROW_ALT },
+      columnStyles       : { 0: { cellWidth:8, halign:'center', fontStyle:'bold' } },
+      didParseCell       : (d) => {
+        if (d.column.index === 0) d.cell.styles.textColor = BLACK;
+      }
+    };
+  }
+
+  // ── Section label ─────────────────────────────────────────────────────────
+  function sectionLabel(label, y) {
+    doc.setTextColor(...MID_GREY);
+    doc.setFont('helvetica','bold'); doc.setFontSize(7.5);
+    doc.text(label, ML, y);
+    doc.setDrawColor(...RULE_GREY); doc.setLineWidth(0.2);
+    doc.line(ML, y+1.5, W - MR, y+1.5);
+    return y + 5;
+  }
+
+
+  // ── Override pageHeader to accept page num args ───────────────────────────
+  function pageHeader(sectionTitle, pn, total) {
+    doc.setFillColor(...BLACK);
+    doc.rect(0, 0, W, 12, 'F');
+    doc.setTextColor(...WHITE);
+    doc.setFont('helvetica','bold'); doc.setFontSize(9);
+    doc.text('CDR INTELLIGENCE REPORT', ML, 8);
+    doc.setFont('helvetica','normal'); doc.setFontSize(7);
+    doc.text(`${dateStr}   |   Generated: ${now}`, W - MR, 8, {align:'right'});
+    doc.setDrawColor(...RULE_GREY); doc.setLineWidth(0.3);
+    doc.line(ML, 13, W - MR, 13);
+    doc.setTextColor(...DARK_GREY);
+    doc.setFont('helvetica','bold'); doc.setFontSize(8);
+    doc.text(sectionTitle, ML, 19);
+    doc.setDrawColor(...DARK_GREY); doc.setLineWidth(0.4);
+    doc.line(ML, 21, W - MR, 21);
+    return 25;
+  }
+
+  // ── Override pageFooter ───────────────────────────────────────────────────
+  function pageFooter(pn, total) {
+    doc.setDrawColor(...RULE_GREY); doc.setLineWidth(0.3);
+    doc.line(ML, H - 10, W - MR, H - 10);
+    doc.setTextColor(...LIGHT_GREY);
+    doc.setFont('helvetica','normal'); doc.setFontSize(6.5);
+    doc.text('CONFIDENTIAL — For authorised use only', ML, H - 6);
+    doc.text(`Page ${pn} of ${total}`, W - MR, H - 6, {align:'right'});
+  }
+
+  // ── Render a table section; returns new y. Skips if rows empty ───────────
+  // Returns -1 if section was skipped.
+  function renderSection(labelText, tableHead, tableBody, colStyles, currentY) {
+    if (!tableBody || tableBody.length === 0) return -1;
+    const y2 = sectionLabel(labelText, currentY);
+    doc.autoTable({ ...tableStyle(y2),
+      head: [tableHead], body: tableBody,
+      columnStyles: colStyles
+    });
+    return doc.lastAutoTable.finalY + 6;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  //  PAGE 1 — SUMMARY STATISTICS (always rendered)
+  // ═══════════════════════════════════════════════════════════════════════════
+  let y = newPage('SUMMARY STATISTICS');
+
+  // ── 5 primary KPI boxes ──────────────────────────────────────────────────
+  const stats = [
+    { label:'TOTAL CALLS',              value: totalCalls.toLocaleString() },
+    { label:'TOTAL INCOMING CALLS',     value: inCalls.toLocaleString()    },
+    { label:'TOTAL OUTGOING CALLS',     value: outCalls.toLocaleString()   },
+    { label:'TOTAL INCOMING MESSAGES',  value: inSMS.toLocaleString()      },
+    { label:'TOTAL OUTGOING MESSAGES',  value: outSMS.toLocaleString()     },
+  ];
+  const boxW = TW / stats.length;
+  const boxH = 22;
+  stats.forEach((s, i) => {
+    const bx = ML + i * boxW;
+    doc.setDrawColor(...BLACK); doc.setLineWidth(0.4);
+    doc.setFillColor(...WHITE);
+    doc.rect(bx, y, boxW - 2, boxH, 'FD');
+    doc.setFillColor(...HEAD_BG);
+    doc.rect(bx, y, boxW - 2, 1.5, 'F');
+    doc.setTextColor(...MID_GREY);
+    doc.setFont('helvetica','normal'); doc.setFontSize(5.5);
+    doc.text(s.label, bx + (boxW-2)/2, y + 7, {align:'center'});
+    doc.setTextColor(...BLACK);
+    doc.setFont('helvetica','bold'); doc.setFontSize(13);
+    doc.text(s.value, bx + (boxW-2)/2, y + 17, {align:'center'});
+  });
+  y += boxH + 5;
+
+  // ── 6 secondary stat boxes ───────────────────────────────────────────────
+  const totalDur  = filteredData.reduce((s,r)=>s+parseDuration(getVal(r,'duration')),0);
+  const uniqA     = new Set(filteredData.map(r=>getVal(r,'aParty')).filter(Boolean)).size;
+  const uniqB     = new Set(filteredData.map(r=>getVal(r,'bParty')).filter(Boolean)).size;
+  const uniqCells = new Set(filteredData.map(r=>getVal(r,'cellIdA')).filter(Boolean)).size;
+  const roamTotal = filteredData.filter(r=>isRoaming(getVal(r,'roaming'))).length;
+  const avgDur    = totalCalls ? Math.round(totalDur/totalCalls) : 0;
+
+  const stats2 = [
+    { label:'TOTAL DURATION',     value: formatDurLong(totalDur) },
+    { label:'AVG CALL DURATION',  value: formatDurLong(avgDur)   },
+    { label:'UNIQUE SUBSCRIBERS', value: uniqA.toLocaleString()  },
+    { label:'UNIQUE CALLED NOS.', value: uniqB.toLocaleString()  },
+    { label:'UNIQUE CELL IDs',    value: uniqCells.toLocaleString() },
+    { label:'ROAMING CALLS',      value: roamTotal.toLocaleString() },
+  ];
+  const bW2 = TW / stats2.length;
+  const bH2 = 18;
+  stats2.forEach((s, i) => {
+    const bx = ML + i * bW2;
+    doc.setDrawColor(...RULE_GREY); doc.setLineWidth(0.3);
+    doc.setFillColor(250,250,250);
+    doc.rect(bx, y, bW2 - 2, bH2, 'FD');
+    doc.setTextColor(...MID_GREY);
+    doc.setFont('helvetica','normal'); doc.setFontSize(5.5);
+    doc.text(s.label, bx + (bW2-2)/2, y + 5.5, {align:'center'});
+    doc.setTextColor(...DARK_GREY);
+    doc.setFont('helvetica','bold'); doc.setFontSize(10);
+    doc.text(s.value, bx + (bW2-2)/2, y + 14, {align:'center'});
+  });
+  y += bH2 + 7;
+
+  // ── Call type breakdown ──────────────────────────────────────────────────
+  const ctMap = {};
+  filteredData.forEach(r => {
+    const ct = getVal(r,'callType')||'UNKNOWN';
+    ctMap[ct] = (ctMap[ct]||0)+1;
+  });
+  const ctRows = Object.entries(ctMap).sort((a,b)=>b[1]-a[1])
+    .map(([k,v],i) => [i+1, k, v.toLocaleString(),
+      totalCalls ? (v/totalCalls*100).toFixed(1)+'%' : '0%']);
+
+  const r1 = renderSection('CALL TYPE BREAKDOWN',
+    ['#','CALL TYPE','COUNT','% OF TOTAL'], ctRows,
+    { 0:{cellWidth:10,halign:'center',fontStyle:'bold'},
+      2:{halign:'right'}, 3:{halign:'right'} }, y);
+  if (r1 > 0) y = r1;
+
+  pageFooter(1, totalPages);
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  //  PAGE 2 — TOP 20 CALLED NUMBERS (only if data exists)
+  // ═══════════════════════════════════════════════════════════════════════════
+  if (hasCalled) {
+    y = newPage('TOP 20 CALLED NUMBERS (B PARTY)');
+    const r2 = renderSection(
+      'MOST FREQUENTLY CALLED NUMBERS',
+      ['#','CALLED NUMBER (B PARTY)','TOTAL CALLS','TOTAL DURATION','AVG DURATION','UNIQUE CALLERS'],
+      top20Called.map(([k,v],i) => [
+        i+1, k,
+        v.calls.toLocaleString(),
+        formatDurLong(v.dur),
+        formatDurLong(v.calls ? Math.round(v.dur/v.calls) : 0),
+        v.callers.size
+      ]),
+      { 0:{cellWidth:10,halign:'center'},
+        1:{cellWidth:52,fontStyle:'bold'},
+        2:{halign:'right',cellWidth:24},
+        3:{halign:'right',cellWidth:28},
+        4:{halign:'right',cellWidth:28},
+        5:{halign:'right'} },
+      y
+    );
+    if (r2 > 0) y = r2;
+    pageFooter(currentPageNum, totalPages);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  //  PAGE 3 — CELL TOWERS + IMSI (only if at least one has data)
+  // ═══════════════════════════════════════════════════════════════════════════
+  if (hasCellPage) {
+    const cellPageTitle = hasCells && hasIMSI ? 'TOP 20 CELL TOWERS  &  TOP 20 IMSI'
+                        : hasCells            ? 'TOP 20 CELL TOWERS'
+                                              : 'TOP 20 IMSI';
+    y = newPage(cellPageTitle);
+
+    if (hasCells) {
+      const r3a = renderSection(
+        'TOP 20 CELL TOWERS BY ACTIVITY',
+        ['#','CELL ID','ADDRESS','TOTAL HITS','UNIQUE SUBS','TOTAL DURATION','ROAMING'],
+        top20Cells.map(([k,v],i) => [
+          i+1, k,
+          (v.addr||'—').slice(0,35),
+          v.hits.toLocaleString(),
+          v.subs.size,
+          formatDurLong(v.dur),
+          v.roam||0
+        ]),
+        { 0:{cellWidth:10,halign:'center'},
+          1:{cellWidth:30},
+          2:{cellWidth:55,fontSize:6.5},
+          3:{halign:'right',cellWidth:22},
+          4:{halign:'right',cellWidth:22},
+          5:{halign:'right',cellWidth:26},
+          6:{halign:'right'} },
+        y
+      );
+      if (r3a > 0) y = r3a + 2;
+    }
+
+    if (hasIMSI) {
+      const r3b = renderSection(
+        'TOP 20 IMSI BY CALL ACTIVITY',
+        ['#','IMSI','TOTAL CALLS','TOTAL DURATION','UNIQUE SUBSCRIBERS','ROAMING CALLS'],
+        top20IMSI.map(([k,v],i) => [
+          i+1, k,
+          v.calls.toLocaleString(),
+          formatDurLong(v.dur),
+          v.subs.size,
+          v.roam
+        ]),
+        { 0:{cellWidth:10,halign:'center'},
+          1:{cellWidth:48},
+          2:{halign:'right',cellWidth:24},
+          3:{halign:'right',cellWidth:28},
+          4:{halign:'right',cellWidth:32},
+          5:{halign:'right'} },
+        y
+      );
+      if (r3b > 0) y = r3b;
+    }
+
+    pageFooter(currentPageNum, totalPages);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  //  PAGE 4 — TOP 20 IMEI (only if data exists)
+  // ═══════════════════════════════════════════════════════════════════════════
+  if (hasIMEI) {
+    y = newPage('TOP 20 IMEI DEVICES');
+    const r4 = renderSection(
+      'TOP 20 DEVICES BY CALL ACTIVITY',
+      ['#','IMEI','ASSOCIATED IMSI','TOTAL CALLS','TOTAL DURATION','UNIQUE SUBSCRIBERS','ROAMING CALLS'],
+      top20IMEI.map(([k,v],i) => [
+        i+1, k,
+        v.imsi||'—',
+        v.calls.toLocaleString(),
+        formatDurLong(v.dur),
+        v.subs.size,
+        v.roam
+      ]),
+      { 0:{cellWidth:10,halign:'center'},
+        1:{cellWidth:45},
+        2:{cellWidth:40,fontSize:6.5},
+        3:{halign:'right',cellWidth:22},
+        4:{halign:'right',cellWidth:26},
+        5:{halign:'right',cellWidth:30},
+        6:{halign:'right'} },
+      y
+    );
+    if (r4 > 0) y = r4;
+    pageFooter(currentPageNum, totalPages);
+  }
+
+  // ── Save ──────────────────────────────────────────────────────────────────
+  doc.save(`CDR_Intelligence_Report_${dateStr}.pdf`);
+}
+
+// Format duration as e.g. "2h 14m 05s"
+function formatDurLong(s) {
+  s = Math.round(s || 0);
+  if (s <= 0) return '—';
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  if (h > 0) return `${h}h ${String(m).padStart(2,'0')}m`;
+  if (m > 0) return `${m}m ${String(sec).padStart(2,'0')}s`;
+  return `${sec}s`;
+}
+</script>
+</body>
+</html>
